@@ -925,3 +925,116 @@ README 里链接 `https://github.com/xzymoon/KOreader-FNS-plugin/issues/new`，�
 | 截图 | 给 README 加 KOreader 菜单截图 + Obsidian HL@ 块截图 | 15 分钟，提升项目观感 |
 | 推广 | 写文章发 KOreader 社区 / Obsidian 论坛 / 小红书 | 用户决定是否做 |
 | GitHub Issue Templates | 配置 "Commercial licensing inquiry" 等模板 | 可选改进 |
+
+---
+
+## 夜间追加：删除 + 重建 GitHub 仓库（清除 MIT 历史）
+
+### 决策背景
+
+用户进一步追问："那我是否可以删除库，然后重新发？"
+
+前面 "License 切换" 章节已经说明：法律上 MIT 授权一旦发出**永久不可撤销**，删除仓库也改变不了"已发出 MIT"这个事实。但用户经过完整 trade-off 评估后，决定还是重建，目的是：
+
+- **心理层面**：新仓库从第一天就是 PolyForm，没有 MIT 时期痕迹
+- **git history 干净**：squash 成单个 commit，没有 MIT 时期的 LICENSE commit
+- **外部索引干净**：搜索引擎 / Sourcegraph / GitHub 镜像从新仓库开始抓
+- **0 star / 0 fork / 0 issue**：实质无损失
+
+### 决策：方案 Y（Squash + 保留 progress）
+
+| 维度 | 选择 |
+|---|---|
+| 重建策略 | Y (squash 21 commit → 1 commit) + 保留 progress 文档 |
+| 新仓库第一个 release | v1.0.0 (从零开始，license 是 PolyForm) |
+
+为什么不选 X (保留 21 commit history)：21 个 commit 里有 MIT LICENSE 那个 commit (`f9f2df6`)，git history 看到那个 commit 显得不"干净"。
+为什么不选 Z (删除 progress)：progress 文档是宝贵的开发记录，删了可惜。
+
+### 7 阶段执行流程
+
+| 阶段 | 操作 | 执行者 |
+|---|---|---|
+| 1. 本地 squash | 创建 `backup-pre-squash` 分支保留原 21 commit；`git checkout --orphan new-master`；commit；替换 master；打 v1.0.0 tag | Claude |
+| 2. 删除旧 GitHub 仓库 | Settings → Danger Zone → Delete repository | 用户 |
+| 3. 重建同名仓库 | github.com/new，不勾选 README/.gitignore/LICENSE 避免冲突 | 用户 |
+| 4. 推送新仓库 | `git push -u origin master` + `git push origin v1.0.0` | Claude |
+| 5. 配置 About | description + topics (koreader/obsidian/plugin/sync/highlights/notes) + 勾选 Releases | 用户 |
+| 6. 发布 v1.0.0 Release | tag v1.0.0 + 完整 release notes（功能介绍 + 安装 + License）| 用户 |
+| 7. 更新 progress | 追加本节决策记录 + commit | Claude |
+
+### 阶段 1 squash 具体步骤
+
+```bash
+git branch backup-pre-squash       # 安全网：保留原 21 commit
+git checkout --orphan new-master   # 创建孤儿分支（无历史）
+# orphan 自动 staged 所有文件
+git commit -m "KOreader FNS Sync Plugin v1.0.0 — initial commit ..."
+git branch -D master                # 删除旧 master
+git branch -m new-master master     # 把 new-master 重命名为 master
+git tag -d v1.0.0                   # 旧 tag 指向 MIT 时期 commit
+git tag v1.0.0                      # 在新 squashed commit 上打同名 tag
+```
+
+squashed commit hash: `24fdba3`
+backup branch hash: 保留原 `94350c3` HEAD（含 21 commit）
+
+### squash 后的 commit message
+
+```
+KOreader FNS Sync Plugin v1.0.0 — initial commit
+
+Features (M1-M6):
+- 基础同步: 高亮 + 笔记 → Obsidian via FNS REST API
+- HL@ marker 条目级 diff (Obsidian 端穿插编辑的内容会被保留)
+- 模板定制: 摘录 / 笔记 / 文件名 / 颜色 emoji
+- per-book title/author override (适合合集场景)
+- 自动同步: debounce + 关书触发
+- 离线队列: 持久化 + 联网自动补推 + 失败重试/冻结
+
+License: PolyForm Noncommercial 1.0.0
+商业使用需通过 GitHub Issue 联系
+
+See progress/ for development history.
+```
+
+### 阶段 4 验证（远程 API 查询）
+
+| 项 | 状态 |
+|---|---|
+| 远程 commit 数 | 1 个（`24fdba3`）✅ |
+| default_branch | master ✅ |
+| License | NOASSERTION（PolyForm 不在 SPDX 标准列表，GitHub 显示 "Other"，正常） |
+| Release | 1 个 v1.0.0，draft=false ✅ |
+
+### 法律现实再次确认（写给未来翻看此文档的自己）
+
+**重建仓库 ≠ 撤销 MIT**：
+
+- 旧仓库 v1.0.0 在 MIT 协议下公开过几小时，理论上 GitHub 公开仓库可能已被搜索引擎 / 镜像 / 爬虫抓取过副本
+- 这些副本即使原仓库删除，它们手上的副本**法律上仍受 MIT 保护**
+- **但实际风险几乎为零**：0 star / 0 watcher / 0 download，几乎没有备份服务真的抓这个小仓库
+
+**重建的实际收益**（不是法律层面，而是项目展示层面）：
+
+- 新仓库访客看到的第一个 commit 就是 PolyForm（不是 MIT）
+- git history 没有 MIT LICENSE 那个 commit
+- 搜索引擎从零开始索引 PolyForm 版本
+- 心理上"干净开始"
+
+### backup-pre-squash 分支的处理
+
+本地保留 backup 分支作为安全网，**不推到 GitHub**（否则 squash 就没意义了）。如果未来确认新仓库稳定 + 不需要回溯，可以本地删除：
+
+```bash
+git branch -D backup-pre-squash   # 仅当完全确认不需要回滚时
+```
+
+短期保留（至少几天），确保新仓库运行正常后再清理。
+
+### 今日最终 commit 总览
+
+新仓库只有 1 个 commit（squashed initial commit `24fdba3`）+ 阶段 7 的 progress 追加 commit（待提交）。
+
+旧仓库的 21 个 commit 历史保留在本地 `backup-pre-squash` 分支，**不推 GitHub**。
+
