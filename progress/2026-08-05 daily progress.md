@@ -1152,5 +1152,100 @@ git branch -D backup-pre-squash   # 仅当完全确认不需要回滚时
 13. License (PolyForm Noncommercial)
 ```
 
+---
+
+## 夜间收尾:今日最终总结
+
+### M7 范围确认
+
+用户拍板:**只做跨设备冲突解决**(不做双向同步)。
+
+理由:之前 M5 设计文档写过"双向同步(Obsidian → KOreader)不在路线图",今天再次确认。M7 只解决"两台 Kindle 同步同一本书"的并发问题,工作量预估 3-5 天。
+
+### 后续任务执行顺序
+
+用户选**选项 2 + B 优先**:
+
+```
+1. ✅ B 截图(已完成)
+2. → M7 跨设备冲突开发(几天)
+3. → C 推广文章(几小时,3 个渠道)
+```
+
+### 今日完整里程碑时间线
+
+| 时段 | 里程碑 | 状态 |
+|---|---|---|
+| 下午 | M5 自动同步 6 场景实测(A/B/C/E 修复 + D/F 通过) | ✅ |
+| 下午-傍晚 | M6 离线队列设计 + 多角色审查 + 实施 + 实测修复 | ✅ |
+| 傍晚 | 傍晚终极 bug 修复(DocSettings 内存 vs 文件双数据源) | ✅ |
+| 傍晚 | 写 README + plugin README + LICENSE(MIT)+ 微信赞助二维码 | ✅ |
+| 傍晚 | GitHub 首次推送 + 发布 v1.0.0 release(首次填错 tag 名,已修) | ✅ |
+| 晚间 | 加英文 README + 修复 PayPal 徽章 + .github/FUNDING.yml | ✅ |
+| 晚间 | License 切换 MIT → PolyForm Noncommercial 1.0.0(用户要求禁止商业) | ✅ |
+| 晚间 | v1.0.0 历史遗留决策(选 A 保留不动)| ✅ |
+| 夜间 | 删除 + 重建 GitHub 仓库(squash + 方案 Y + 新 v1.0.0 直接 PolyForm)| ✅ |
+| 夜间 | README 加 ASCII 菜单树状图(中英两份,风格 1)| ✅ |
+| 夜间 | README 加 Obsidian HL@ 块截图(中英两份,渲染 + 源码)| ✅ |
+| 夜间 | M7 范围确认 + 后续执行顺序决定 | ✅ |
+
+### 今日新仓库 commit 总览(squash 后)
+
+| Commit | 类型 | 内容 |
+|---|---|---|
+| `24fdba3` | initial | squashed v1.0.0 initial commit (M1-M6 完整功能 + PolyForm) |
+| `2d6dabf` | docs | 追加删除 + 重建 GitHub 仓库决策记录 |
+| `6e6e50b` | docs | README 加 ASCII 菜单树状图(中英两份)|
+| `9aa443c` | docs | README 加 Obsidian HL@ 块截图(中英两份)|
+
+共 4 个 commit(旧仓库的 21 个 commit 保留在本地 backup-pre-squash 分支)。
+
+### 关键产品决策(用户拍板的)
+
+| 决策点 | 选择 |
+|--------|------|
+| M5 离线行为 | 静默跳过(不弹 WiFi)|
+| M6 重试上限 | 5 次后冻结 |
+| M6 token 失效处理 | 全部队列冻结 + 一次性 toast |
+| 联系入口 | GitHub Issue |
+| PayPal 修法 | shields.io 徽章 + FUNDING.yml |
+| 英文 README 方案 | 中文为主 + 英文版切换 |
+| License 类型 | PolyForm Noncommercial 1.0.0 |
+| v1.0.0 历史遗留 | 选 A(保留不动)|
+| 仓库重建方案 | Y(squash + 保留 progress)|
+| 新仓库版本号 | v1.0.0(从零开始)|
+| 菜单图风格 | 风格 1(树状)|
+| 截图语言策略 | A(中英两份独立)|
+| 国际化方案 | C(完整国际化,留待以后)|
+| M7 范围 | 只做跨设备冲突(不做双向同步)|
+| 后续执行顺序 | 选项 2 + B 优先(B → M7 → C)|
+
+### 关键经验(已记入 memory)
+
+1. **多角色审查有效但不全能**:数据源类 bug 只有实测能发现(M6 DocSettings 双数据源)
+2. **DEBUG 日志挽救诊断**:parse/client/diff 三行 dbg 是定位根因的关键
+3. **License 不能追溯**:MIT 一旦发出永久不可撤销,删除 + 重建只解决展示层面
+4. **ASCII 树状图 vs 截图**:菜单结构用 ASCII 更合适(可维护 + 树状清晰 + diff 友好)
+
+### 当前仓库最终状态
+
+- 仓库 URL: https://github.com/xzymoon/KOreader-FNS-plugin
+- 远程 commit 数: 4 个
+- License: PolyForm Noncommercial 1.0.0
+- Release: v1.0.0(干净 license)
+- README: 中英双语 + 13 个章节(菜单 ASCII 图 + 端到端截图 + 商业授权)
+- Sponsor 按钮: About 区域(FUNDING.yml 触发)
+- 本地 backup-pre-squash 分支: 保留原 21 commit 安全网
+
+### 明日候选
+
+| 优先级 | 任务 | 工作量 | 启动条件 |
+|---|---|---|---|
+| **高** | **M7 跨设备冲突**设计 + 多阶段审查 + 实施 | 3-5 天 | 用户决定何时启动 |
+| 中 | GitHub Issue Templates(商业咨询 / bug report) | 30 分钟 | 可选 |
+| 中 | 国际化方案 C(英文菜单 + 中文 .po 翻译)| 3-5 小时 | 国际用户反馈后启动 |
+| 低 | 删除本地 backup-pre-squash 分支 | 10 秒 | 确认新仓库稳定后 |
+
+
 
 
