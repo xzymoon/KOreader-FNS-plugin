@@ -1,0 +1,25 @@
+# Claude Code 本地配置（个人配置，不进版本控制）
+.claude/
+
+# 临时文件
+*.tmp
+*.bak
+*~
+*.swp
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# macOS
+.DS_Store
+
+# Lua 编译缓存
+*.luac
+
+# 日志
+*.log
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,1534 @@
+--[[--
+FNS Sync — sync KOreader highlights/notes to Obsidian via Fast Note Sync.
+
+Current implementation:
+  - M1: Plugin skeleton (WidgetContainer:extend, _meta autoloaded)
+    Settings persistence (G_reader_settings["fns_sync"])
+    Full settings menu tree + service connection / per-book overrides
+  - M2: FNS HTTP client (getNote / overwriteNote / createNote)
+  - M3: render markdown from annotations + sync current book
+  - M4: marker-based precise insertion (HL@ block diff)
+  - M5: AnnotationsModified + CloseDocument auto-sync (debounced),
+    silent offline-skip via skip_run_when_online (TOCTOU fix)
+  - M6: Offline queue (this file, see "Offline queue" section)
+    - Persists pending books to G_reader_settings["fns_sync_queue"]
+    - Drains on NetworkConnected (1s debounce) + 3 fallback paths
+    - Serial chain processing (_queue_processing lock, distinct from
+      M5's _sync_in_flight) to avoid concurrent sync on the same book
+    - Failure handling: attempts++ → freeze at MAX_RETRY_ATTEMPTS(5);
+      token-invalid (307/308) → freeze ALL + toast
+    - Book file gone (renamed/deleted) → drop entry, don't burn attempts
+
+Stubbed:
+  - onSyncAllHistory (M7): walk history dir, batch sync per book
+  - sync_on_book_open (reserved for future pull-sync milestone)
+
+Not in scope:
+  - Cross-device conflict resolution (M7+)
+  - Encryption of queue at rest (accepted risk, see config.lua PII note)
+
+@module fns_sync.main
+--]]--
+
+local InfoMessage = require("ui/widget/infomessage")
+local InputDialog = require("ui/widget/inputdialog")
+local NetworkMgr = require("ui/network/manager")
+local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local _ = require("gettext")
+local T = require("ffi/util").template
+local logger = require("logger")
+
+local Config = require("config")
+local Api = require("api")
+local Excerpt = require("excerpt")
+local Marker = require("marker")
+
+local FnsSync = WidgetContainer:extend{
+    name = "fns_sync",
+    -- M6: is_doc_only=true ensures the plugin is instantiated only in
+    -- ReaderUI, not in FileManager. Without this, broadcastEvent (e.g.
+    -- NetworkConnected) reaches both instances, and self._queue_processing
+    -- becomes per-instance → mutual exclusion fails (HIGH-A fix).
+    -- Trade-off: FileManager-only online events won't drain the queue;
+    -- user must open a book. Acceptable given typical reading flow.
+    is_doc_only = true,
+}
+
+-- ===========================================================================
+-- Lifecycle
+-- ===========================================================================
+
+function FnsSync:init()
+    self.settings = G_reader_settings:readSetting("fns_sync", {})
+    -- Backfill any missing defaults (preserves user values already set).
+    -- NOTE: table-typed defaults are assigned by reference. No menu today
+    -- mutates them, so this is safe; revisit (deep copy) when M5 adds
+    -- color-emoji-map editing.
+    for k, v in pairs(Config.DEFAULTS) do
+        if self.settings[k] == nil then
+            self.settings[k] = v
+        end
+    end
+
+    -- Schema version migration. Each `if prev < N` block ports older
+    -- settings forward; chained blocks handle skips (v1 → v3 runs v1→v2,
+    -- v2→v3 in order). DEFAULTS backfill above only fills nil fields,
+    -- so templates persisted by older plugin versions would otherwise
+    -- linger forever — this is the only place they get refreshed.
+    local prev_version = self.settings.config_version or 1
+    if prev_version < Config.CURRENT_CONFIG_VERSION then
+        -- v1 → v2 (M4): HIGHLIGHTS_START/END region markers replaced by
+        -- {{HIGHLIGHTS}} placeholder + per-item HL@ blocks; excerpt
+        -- timestamp changed from <!-- H:.. --> to *H: ..*. Old templates
+        -- persisted in settings must be forcibly refreshed, otherwise
+        -- renderFullNote falls back to appending HL@ blocks at the end
+        -- (leaving an empty HIGHLIGHTS_START/END zone) and renderExcerpt
+        -- keeps emitting the HTML-comment timestamp.
+        if prev_version < 2 then
+            self.settings.note_template = Config.DEFAULTS.note_template
+            self.settings.excerpt_template = Config.DEFAULTS.excerpt_template
+            logger.info("[FNS] migrated settings v1→v2: refreshed note_template and excerpt_template")
+        end
+        -- v2 → v3: excerpt template restructured — page number now on its
+        -- own line, multi-line body quote prefix handled in renderExcerpt,
+        -- redundant *H: {datetime}* removed (HL@ block markers already
+        -- carry the datetime). Refresh excerpt_template so existing users
+        -- pick up the new format on next sync.
+        if prev_version < 3 then
+            self.settings.excerpt_template = Config.DEFAULTS.excerpt_template
+            logger.info("[FNS] migrated settings v2→v3: refreshed excerpt_template (new page/body layout)")
+        end
+        self.settings.config_version = Config.CURRENT_CONFIG_VERSION
+    end
+
+    G_reader_settings:saveSetting("fns_sync", self.settings)
+
+    -- M5 auto-sync runtime state (NOT persisted — runtime only).
+    -- _auto_sync_action is a stable closure used as UIManager:scheduleIn /
+    -- unschedule action key. A fresh closure each call would break unschedule
+    -- (it matches by reference), leaking tasks after close-document.
+    -- _sync_in_flight guards against concurrent syncs (manual button + auto
+    -- trigger racing on the same book).
+    self._auto_sync_action = function() self:_autoSyncCurrentBook() end
+    self._sync_in_flight = false
+
+    -- M6: Offline queue state.
+    -- self.queue is the persistent table (keyed by book path) stored in
+    -- G_reader_settings["fns_sync_queue"]. Each entry: { ts, attempts, title }.
+    -- Contains PII (book paths + titles); see config.lua privacy note.
+    self.queue = G_reader_settings:readSetting("fns_sync_queue", {}) or {}
+
+    -- _queue_processing guards _processQueue against re-entry (HIGH-2 fix).
+    -- Distinct from _sync_in_flight (M5 lock) so queue processing and
+    -- realtime M5 sync don't deadlock each other (HIGH-B fix).
+    self._queue_processing = false
+
+    -- _last_network_event_ts for 100ms debounce of onNetworkConnected
+    -- (M-7 fix: network jitter can fire the event multiple times rapidly).
+    self._last_network_event_ts = 0
+
+    -- M6 review (H-3): stable closure for queue drain. All scheduleIn /
+    -- nextTick calls reference this single function so onCloseWidget can
+    -- unschedule them. Without this, UIManager closures hold dead self
+    -- references after ReaderUI teardown → operate on half-destroyed state.
+    self._queue_drain_action = function() self:_processQueue() end
+
+    if self.ui and self.ui.menu then
+        self.ui.menu:registerToMainMenu(self)
+    end
+
+    -- M6 review fix (C failure): NetworkConnected may broadcast before
+    -- our widget registers (race on restart), so don't rely on the event
+    -- alone. Schedule a one-shot queue check 2s after init if online.
+    -- 2s (longer than _PROCESS_QUEUE_DELAY=0.5) gives ReaderUI time to
+    -- fully come up before we start firing HTTP.
+    local queue_size = 0
+    for _ in pairs(self.queue) do queue_size = queue_size + 1 end
+    local online = NetworkMgr:isOnline()
+    logger.info(string.format("[FNS] init: queue_size=%d online=%s offline_queue=%s",
+        queue_size, tostring(online), tostring(self.settings.offline_queue_enabled)))
+    if online then
+        logger.info("[FNS] init: scheduleIn(2s) → _processQueue (startup drain)")
+        UIManager:scheduleIn(2, self._queue_drain_action)
+    else
+        logger.info("[FNS] init: offline, waiting for onNetworkConnected")
+    end
+end
+
+function FnsSync:saveSettings()
+    G_reader_settings:saveSetting("fns_sync", self.settings)
+end
+
+-- M6: Persist the offline queue. Best-effort: KOreader's LuaSettings does
+-- not return a status from saveSetting (it sets the in-memory table; flush
+-- happens on shutdown). HIGH-E fix is partial — we trust KOreader's write
+-- path; on corruption, the queue may be lost on restart. Mitigation: queue
+-- entries are reconstructable from local metadata.lua (highlights persist
+-- there), so worst case is "no auto-retry", not "data loss".
+function FnsSync:_saveQueue()
+    G_reader_settings:saveSetting("fns_sync_queue", self.queue)
+end
+
+-- ===========================================================================
+-- Generic UI helpers
+-- ===========================================================================
+
+--- Open an input dialog bound to settings[key].
+-- Uses InputDialog's standard save_callback/reset_callback pattern,
+-- which auto-provides |Reset|Save|Close| buttons (KOreader convention).
+function FnsSync:_editString(key, title, hint, allow_newline)
+    local dialog = InputDialog:new{
+        title = title,
+        input = tostring(self.settings[key] or ""),
+        input_hint = hint or "",
+        allow_newline = allow_newline == true,
+        save_callback = function(content)
+            self.settings[key] = content
+            self:saveSettings()
+        end,
+        reset_callback = function()
+            local default = Config.DEFAULTS[key]
+            return default ~= nil and tostring(default) or ""
+        end,
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+--- Edit a per-book override field (title or author) for the currently open book.
+-- Empty input clears the field's override; if no override fields remain, the
+-- whole entry is removed (falls back to doc_props entirely).
+function FnsSync:_editBookOverride(field, label)
+    local path = self:_getCurrentBookPath()
+    if not path then
+        UIManager:show(InfoMessage:new{ text = _("无打开的书"), timeout = 2 })
+        return
+    end
+    self.settings.book_overrides = self.settings.book_overrides or {}
+    local o = self.settings.book_overrides[path] or {}
+    -- Pre-fill with current override value, or fall back to effective meta
+    local current = o[field]
+    if current == nil or current == "" then
+        current = self:_getBookMetadata()[field] or ""
+    end
+
+    local dialog = InputDialog:new{
+        title = label,
+        input = current,
+        input_hint = _("留空清除自定义，回退到文件元数据"),
+        save_callback = function(content)
+            -- Trim trailing newlines (InputDialog sometimes appends them)
+            content = content:gsub("\n+$", "")
+            self.settings.book_overrides[path] = self.settings.book_overrides[path] or {}
+            if content == "" then
+                self.settings.book_overrides[path][field] = nil
+                -- Drop the entry entirely if both fields are gone
+                local remaining = self.settings.book_overrides[path]
+                local empty = true
+                for _ in pairs(remaining) do empty = false; break end
+                if empty then
+                    self.settings.book_overrides[path] = nil
+                end
+            else
+                self.settings.book_overrides[path][field] = content
+            end
+            self:saveSettings()
+        end,
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+--- Remove all per-book overrides for the currently open book.
+function FnsSync:_clearBookOverride()
+    local path = self:_getCurrentBookPath()
+    if not path then return end
+    if not self.settings.book_overrides or not self.settings.book_overrides[path] then
+        UIManager:show(InfoMessage:new{ text = _("当前书没有自定义信息"), timeout = 2 })
+        return
+    end
+    self.settings.book_overrides[path] = nil
+    self:saveSettings()
+    UIManager:show(InfoMessage:new{ text = _("已重置为文件元数据"), timeout = 2 })
+end
+
+--- Toggle a boolean setting and persist.
+function FnsSync:_toggleBool(key)
+    self.settings[key] = not self.settings[key]
+    self:saveSettings()
+end
+
+-- ===========================================================================
+-- Action callbacks
+-- ===========================================================================
+
+function FnsSync:isConfigured()
+    return self.settings.server_url ~= ""
+        and self.settings.api_token ~= ""
+        and self.settings.vault ~= ""
+end
+
+--- Run the test connection probe and show result via InfoMessage.
+function FnsSync:onTestConnection()
+    if not self:isConfigured() then
+        UIManager:show(InfoMessage:new{
+            text = _("请先填写 FNS 服务 URL、API Token 和 Vault 名"),
+        })
+        return
+    end
+    NetworkMgr:runWhenOnline(function()
+        UIManager:show(InfoMessage:new{
+            text = _("正在测试连接…"),
+            timeout = 1,
+        })
+        UIManager:nextTick(function()
+            local result = Api:testConnection(self.settings)
+            UIManager:show(InfoMessage:new{
+                text = result.message,
+                timeout = (result.success and 2) or 5,
+            })
+        end)
+    end)
+end
+
+--- Reset every setting back to Config.DEFAULTS (with confirmation).
+function FnsSync:onResetConfig()
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = _("将所有 FNS 同步配置重置为默认值？此操作不可撤销。"),
+        ok_text = _("重置"),
+        cancel_text = _("取消"),
+        ok_callback = function()
+            self.settings = {}
+            for k, v in pairs(Config.DEFAULTS) do
+                self.settings[k] = v
+            end
+            self:saveSettings()
+            UIManager:show(InfoMessage:new{
+                text = _("配置已重置为默认值"),
+            })
+        end,
+    })
+end
+
+--- Get the absolute file path of the currently open book, or nil if no book.
+function FnsSync:_getCurrentBookPath()
+    if not self.ui or not self.ui.document then return nil end
+    return self.ui.document.file
+end
+
+--- Pull doc_props into a flat metadata table for rendering.
+-- Per-book overrides (settings.book_overrides[path]) take precedence over
+-- doc_props for title and author; language always comes from doc_props.
+function FnsSync:_getBookMetadata()
+    local props = (self.ui and self.ui.doc_props) or {}
+    local meta = {
+        title    = props.title or "",
+        author   = props.authors or "",
+        language = props.language or "",
+    }
+    local path = self:_getCurrentBookPath()
+    if not path then return meta end
+    local overrides = self.settings.book_overrides or {}
+    local o = overrides[path]
+    if not o then return meta end
+    -- Override only with non-empty strings; empty means "cleared by user"
+    -- but we already pruned empty fields in _editBookOverride, so they won't
+    -- be present in `o`. Defensive check anyway.
+    if o.title and o.title ~= "" then meta.title = o.title end
+    if o.author and o.author ~= "" then meta.author = o.author end
+    return meta
+end
+
+--- Sanitize a server-returned message before exposing to UI/logs.
+-- M6 (HIGH-H + review S-1 hardening): some gateways echo Authorization
+-- headers or token fragments in 4xx bodies. Match common credential
+-- patterns case-insensitively (via character classes, since Lua patterns
+-- lack flags) and replace with <redacted>. Covers Bearer / Authorization /
+-- Token / api_key / password / secret markers; both ":" and "=" separators.
+-- Limitations: URL-encoded / Base64-wrapped / JSON-escaped tokens may bypass.
+-- Accepted — legitimate server errors don't encode credentials this way.
+local function _sanitizeServerMessage(raw)
+    if raw == nil then return "" end
+    local s = tostring(raw)
+    local patterns = {
+        "[Bb][Ee][Aa][Rr][Ee][Rr]%s+[%w_%-%.]+",      -- Bearer xxx
+        "[Aa]uthorization%s*[:=]%s*%S+",               -- Authorization: xxx
+        "[Tt]oken%s*[:=]%s*[%w_%-%.]+",                -- Token: xxx
+        "[Aa]pi[_-]?[Kk]ey%s*[:=]%s*[%w_%-%.]+",       -- api_key=xxx
+        "[Pp]assword%s*[:=]%s*%S+",                    -- password=xxx
+        "[Ss]ecret%s*[:=]%s*%S+",                      -- secret=xxx
+    }
+    for _, pat in ipairs(patterns) do
+        s = s:gsub(pat, "<redacted>")
+    end
+    if #s > 200 then s = s:sub(1, 200) .. "…" end
+    return s
+end
+
+--- Show a unified sync-error InfoMessage from an Api result table.
+function FnsSync:_showSyncError(result)
+    local raw_msg = result.message
+    local safe_msg = _sanitizeServerMessage(raw_msg)
+    local msg
+    if result.network_error then
+        msg = _("网络错误：") .. (safe_msg ~= "" and safe_msg or _("未知错误"))
+        logger.warn("[FNS] sync error (network): " .. safe_msg)
+    else
+        msg = string.format(_("同步失败 [code=%s]：%s"),
+            tostring(result.biz_code or "?"),
+            safe_msg ~= "" and safe_msg or _("未知错误"))
+        logger.warn("[FNS] sync error biz_code=" .. tostring(result.biz_code)
+            .. " msg=" .. safe_msg)
+    end
+    UIManager:show(InfoMessage:new{ text = msg, timeout = 5 })
+end
+
+--- Sync current book: GET → marker-zone replace → POST (or create if absent).
+-- Marker zone is fully rewritten on every sync (M3 strategy, see progress
+-- doc 2026-08-02). User edits OUTSIDE the markers are preserved.
+--- Shared sync entry for both manual button (silent=false) and auto-sync
+-- (silent=true). Captures annotations/meta/path eagerly so the closure
+-- doesn't depend on self.ui after return — matters for the close-document
+-- path where ReaderUI may be torn down before nextTick fires.
+-- STRONG INVARIANT: do NOT read self.ui inside the nextTick closure below.
+-- All ui-derived state must be captured into locals above this point.
+-- Guards: _sync_in_flight (concurrent sync skip), enabled, isConfigured,
+-- annotations non-empty. All UI feedback gated by `silent`.
+--
+-- opts.skip_run_when_online: bypass NetworkMgr:runWhenOnline wrapper.
+-- Auto-sync paths set this true because runWhenOnline has a TOCTOU window
+-- between _autoSyncCurrentBook's isOnline check and the actual call — if
+-- the network drops in between, runWhenOnline would pop a "turn on WiFi?"
+-- prompt, which is catastrophic on the close-document path (prompt lands
+-- on FileManager after reader teardown). Auto paths already gate on
+-- isOnline explicitly, so the wrapper is redundant; manual button keeps
+-- the wrapper because a user-initiated action reasonably prompts for WiFi.
+function FnsSync:_triggerSync(opts)
+    opts = opts or {}
+    local silent = opts.silent == true
+    if self._sync_in_flight then
+        logger.info("[FNS] sync skipped: another in flight")
+        return
+    end
+    if not self.settings.enabled then
+        if not silent then
+            UIManager:show(InfoMessage:new{ text = _("FNS 同步未启用") })
+        end
+        return
+    end
+    if not self:isConfigured() then
+        if not silent then
+            UIManager:show(InfoMessage:new{ text = _("请先配置服务 URL / Token / Vault") })
+        end
+        return
+    end
+    local annotations = self.ui and self.ui.annotation
+        and self.ui.annotation.annotations or {}
+    if #annotations == 0 then
+        if not silent then
+            UIManager:show(InfoMessage:new{ text = _("当前书没有高亮/笔记") })
+        end
+        return
+    end
+
+    local meta = self:_getBookMetadata()
+    local path = Excerpt:resolvePath(self.settings, meta)
+    logger.info(string.format("[FNS] sync start (%s): title=%s annotations=%d path=%s",
+        silent and "auto" or "manual",
+        tostring(meta.title), #annotations, path))
+
+    self._sync_in_flight = true
+    local run = function()
+        if not silent then
+            UIManager:show(InfoMessage:new{ text = _("正在同步…"), timeout = 1 })
+        end
+        UIManager:nextTick(function()
+            local ok, err = pcall(function()
+                self:_doSyncCurrentBook(annotations, meta, path, silent)
+            end)
+            self._sync_in_flight = false
+            if not ok then
+                logger.warn("[FNS] sync pcall failed: " .. tostring(err))
+            end
+        end)
+    end
+    if opts.skip_run_when_online then
+        run()
+    else
+        NetworkMgr:runWhenOnline(run)
+    end
+end
+
+-- Manual button. Force-clears the in-flight lock first: a previous
+-- runWhenOnline that hung on an offline WiFi-prompt (and was cancelled by
+-- the user) would otherwise leave the lock stuck, blocking all future syncs.
+-- A manual press is an explicit user intent — let it through even at the
+-- cost of a potential concurrent request (the API is idempotent on path).
+function FnsSync:onSyncCurrentBook()
+    logger.info("[FNS] event: onSyncCurrentBook (manual button)")
+    self._sync_in_flight = false
+    self:_triggerSync{ silent = false }
+end
+
+function FnsSync:_doSyncCurrentBook(annotations, meta, path, silent)
+    -- Render current KOreader highlights into a { ts -> block_content } table.
+    -- This is the source-of-truth for what should be in the note after sync.
+    --
+    -- Returns a result table (M6): { ok=true, ... } on success,
+    -- { ok=false, reason="get_failed"|"overwrite_failed"|"create_failed"|"race"|"no_annotations",
+    --   result=<api_result> } on API failure.
+    -- M5 caller (_triggerSync via nextTick) ignores the return value, so this
+    -- addition is backward-compatible. M6 caller (_processQueueItem) inspects
+    -- the result to advance attempts / detect token failure / drop entry.
+
+    -- M6 review fix (E failure defense): refuse to sync empty annotations.
+    -- Without this guard, Marker.diff(segments, {}) would mark ALL existing
+    -- HL@ blocks for deletion → wipe the user's Obsidian note. The M5 path
+    -- is protected by _triggerSync's pre-check, but the M6 queue path
+    -- bypasses _triggerSync, so we guard here too.
+    if annotations == nil or #annotations == 0 then
+        if not silent then
+            UIManager:show(InfoMessage:new{ text = _("当前书没有高亮/笔记"), timeout = 2 })
+        end
+        return { ok = false, reason = "no_annotations" }
+    end
+
+    local highlights_by_ts = Excerpt:renderExcerptBlock(annotations, self.settings)
+
+    local get_result = Api:getNote(self.settings, path)
+    if not get_result.ok then
+        if not silent then self:_showSyncError(get_result) end
+        return { ok = false, reason = "get_failed", result = get_result }
+    end
+
+    if get_result.exists then
+        -- Existing note: parse → diff → applyDiff → serialize → overwrite.
+        -- User content (text outside HL@ blocks) is preserved verbatim.
+        logger.info("[FNS] note exists, doing item-level diff")
+        local segments = Marker.parse(get_result.content)
+        local actions = Marker.diff(segments, highlights_by_ts)
+        local new_segments = Marker.applyDiff(segments, actions)
+        local new_content = Marker.serialize(new_segments)
+
+        -- Verbose-only diff trace (M6 review): useful when diagnosing
+        -- "why didn't my highlight sync" — enable verbose logging in
+        -- KOreader settings to see parsed ts / client ts / computed actions.
+        local _seg_ts, _hl_ts, _act_summary = {}, {}, {}
+        for _, s in ipairs(segments) do
+            if s.type == "hl" then table.insert(_seg_ts, s.ts) end
+        end
+        for ts in pairs(highlights_by_ts) do table.insert(_hl_ts, ts) end
+        for _, a in ipairs(actions) do
+            table.insert(_act_summary, a.op .. ":" .. tostring(a.ts))
+        end
+        logger.dbg("[FNS] diff trace: server_hl=" .. #_seg_ts
+            .. " client_hl=" .. #_hl_ts
+            .. " actions=" .. #actions
+            .. " server_ts=[" .. table.concat(_seg_ts, "|") .. "]"
+            .. " client_ts=[" .. table.concat(_hl_ts, "|") .. "]"
+            .. " actions_detail=[" .. table.concat(_act_summary, "|") .. "]")
+
+
+        local original_ctime = get_result.note and get_result.note.ctime
+        local post_result = Api:overwriteNote(self.settings, path, new_content, original_ctime)
+        if post_result.ok then
+            local n_ins, n_upd, n_del = 0, 0, 0
+            for _, a in ipairs(actions) do
+                if a.op == "insert" then n_ins = n_ins + 1
+                elseif a.op == "update" then n_upd = n_upd + 1
+                elseif a.op == "delete" then n_del = n_del + 1 end
+            end
+            logger.info(string.format("[FNS] sync success at %s: +%d ~%d -%d",
+                path, n_ins, n_upd, n_del))
+            if not silent then
+                UIManager:show(InfoMessage:new{
+                    text = string.format(_("同步成功（+%d 更新%d 删除%d）：\n%s"),
+                        n_ins, n_upd, n_del, path),
+                    timeout = 3,
+                })
+            end
+            return { ok = true, n_ins = n_ins, n_upd = n_upd, n_del = n_del }
+        else
+            if not silent then self:_showSyncError(post_result) end
+            return { ok = false, reason = "overwrite_failed", result = post_result }
+        end
+    else
+        -- First time: render from template, createNote with createOnly=true.
+        logger.info("[FNS] note does not exist, creating new")
+        local new_content = Excerpt:renderFullNote(highlights_by_ts, self.settings, meta)
+        local create_result = Api:createNote(self.settings, path, new_content)
+        if create_result.ok then
+            if create_result.created then
+                logger.info("[FNS] sync success: created note with " .. #annotations .. " annotations at " .. path)
+                if not silent then
+                    UIManager:show(InfoMessage:new{
+                        text = string.format(_("已创建笔记并同步 %d 条摘录：\n%s"), #annotations, path),
+                        timeout = 3,
+                    })
+                end
+                return { ok = true, created = true }
+            elseif create_result.already_exists then
+                logger.info("[FNS] createNote returned already_exists (race), path=" .. path)
+                if not silent then
+                    UIManager:show(InfoMessage:new{
+                        text = _("笔记刚被其他客户端创建，请重试同步"),
+                        timeout = 3,
+                    })
+                end
+                return { ok = false, reason = "race", result = create_result }
+            end
+        else
+            if not silent then self:_showSyncError(create_result) end
+            return { ok = false, reason = "create_failed", result = create_result }
+        end
+    end
+    -- Defensive fallback (should be unreachable).
+    return { ok = false, reason = "unknown" }
+end
+
+-- ===========================================================================
+-- Auto-sync (M5)
+-- ===========================================================================
+
+--- Four-gate check: enabled AND auto_sync_enabled AND isConfigured AND
+-- (a book is open). Per-event sub-switches are checked by the callers
+-- (this only checks gates shared by both highlight and close paths).
+function FnsSync:_gateAutoSync()
+    if not self.settings.enabled then return false end
+    if not self.settings.auto_sync_enabled then return false end
+    if not self:isConfigured() then return false end
+    if not (self.ui and self.ui.annotation) then return false end
+    return true
+end
+
+--- Reschedule the debounce timer. Unschedules the previous action (if any)
+--- using the same closure reference, then schedules a fresh one with the
+--- current debounce_seconds. Consecutive highlight edits within the debounce
+--- window collapse into a single sync this way.
+function FnsSync:_rescheduleAutoSync()
+    UIManager:unschedule(self._auto_sync_action)
+    -- tonumber: _editString stores user input as string; settings loaded from
+    -- sidecar may also be string-typed. tonumber("5")=5, tonumber(nil/abc)=nil→5.
+    -- math.max: UIManager:scheduleIn asserts seconds >= 0; clamp negatives
+    -- (user could type "-1") to 0 so we don't crash on bad input.
+    local delay = tonumber(self.settings.debounce_seconds) or 5
+    delay = math.max(0, delay)
+    UIManager:scheduleIn(delay, self._auto_sync_action)
+end
+
+--- Cancel any pending debounce timer. Called unconditionally on close-document
+--- so a scheduled auto-sync can't fire after ReaderUI teardown (the closure
+--- would dereference a dead self.ui).
+function FnsSync:_cancelAutoSyncTimer()
+    UIManager:unschedule(self._auto_sync_action)
+end
+
+--- Auto-sync entry: silent + offline-skipping. NetworkMgr:runWhenOnline would
+--- pop a "turn on WiFi?" prompt on offline, which is jarring mid-reading and
+--- catastrophic on close (the prompt would land on FileManager after the
+--- reader has already closed). Silent-skip is safe — KOreader persists
+--- highlights to local metadata.lua, so nothing is lost; next open / close /
+--- manual sync catches up when online.
+function FnsSync:_autoSyncCurrentBook()
+    if not NetworkMgr:isOnline() then
+        -- M6: enqueue for auto-retry when NetworkConnected fires.
+        -- (M5 only logged "will catch up on next trigger"; M6 makes it
+        -- automatic — see _enqueueCurrentBook / _processQueue.)
+        if self.settings.offline_queue_enabled then
+            self:_enqueueCurrentBook()
+        else
+            logger.info("[FNS] auto-sync skipped: offline (queue disabled)")
+        end
+        return
+    end
+    -- skip_run_when_online=true: avoid TOCTOU window between isOnline check
+    -- here and NetworkMgr:runWhenOnline's internal recheck. If the network
+    -- drops in between, runWhenOnline would pop a WiFi prompt —
+    -- catastrophic on close-document path. We've already gated on isOnline,
+    -- so the wrapper is redundant for auto paths.
+    self:_triggerSync{ silent = true, skip_run_when_online = true }
+end
+
+--- Highlight add/edit/delete/note change/color change. Payload structure
+--- varies (see readerhighlight.lua / readerbookmark.lua dispatch sites); we
+--- only use the event as a sync trigger signal, so we ignore it.
+function FnsSync:onAnnotationsModified(payload)
+    logger.info("[FNS] event: onAnnotationsModified")
+    if not self:_gateAutoSync() then
+        logger.dbg("[FNS] onAnnotationsModified: _gateAutoSync false")
+        return
+    end
+    if not self.settings.sync_on_highlight then
+        logger.dbg("[FNS] onAnnotationsModified: sync_on_highlight false")
+        return
+    end
+    self:_rescheduleAutoSync()
+end
+
+--- Book close. Always cancel any pending highlight debounce first (even if
+--- close-sync is off — otherwise the timer would fire post-teardown), then
+--- optionally fire an immediate sync.
+function FnsSync:onCloseDocument()
+    logger.info("[FNS] event: onCloseDocument")
+    self:_cancelAutoSyncTimer()
+    if not self:_gateAutoSync() then
+        logger.dbg("[FNS] onCloseDocument: _gateAutoSync false")
+    elseif self.settings.sync_on_book_close then
+        self:_autoSyncCurrentBook()  -- online: sync; offline: enqueue (M6)
+    end
+    -- M6: drain the queue opportunistically. If onNetworkConnected hasn't
+    -- fired or was missed, this is the next-best chance to retry pending
+    -- books. Safe to call regardless of online state (short-circuits on
+    -- offline or when queue is empty).
+    self:_processQueue()
+end
+
+-- ===========================================================================
+-- Offline queue (M6)
+-- ===========================================================================
+
+-- scheduleIn delay after onNetworkConnected fires. Borrowed from KOSync
+-- (kosync.koplugin/main.lua:1014) — lets KOreader internals settle before
+-- we run HTTP requests (avoid races during startup / WiFi bringup).
+local _PROCESS_QUEUE_DELAY = 0.5  -- seconds
+
+--- Add the current book to the persistent queue (keyed by book path).
+-- Dedup: if the path already has an entry, only refresh ts in memory
+-- (avoids hammering saveSettings on rapid highlight edits — M-2/M-4 fix).
+-- First creation writes through to disk immediately so a crash before next
+-- flush doesn't lose the entry (M-2 fix). attempts is preserved on
+-- re-enqueue (a failing book stays failing until user retries manually).
+function FnsSync:_enqueueCurrentBook()
+    local path = self:_getCurrentBookPath()
+    if not path then
+        logger.warn("[FNS] enqueue skipped: no current book path")
+        return
+    end
+    local meta = self:_getBookMetadata()
+    local entry = self.queue[path]
+    if entry == nil then
+        self.queue[path] = {
+            ts = os.time(),
+            attempts = 0,
+            title = meta.title or "",
+        }
+        self:_saveQueue()
+        logger.info(string.format("[FNS] enqueued (new): %s", path))
+    else
+        entry.ts = os.time()
+        entry.title = meta.title or ""
+        logger.info(string.format("[FNS] enqueued (refresh ts): %s", path))
+    end
+end
+
+--- Load a book's annotations from its metadata.lua sidecar by path.
+-- Used by _processQueueItem when draining a book that's no longer open.
+--
+-- Returns: annotations_table, meta, nil   on success
+--          nil, nil, "file_missing"        book file no longer exists
+--          nil, nil, "unsupported_format"  path suffix not in whitelist
+--          nil, nil, "metadata_missing"    DocSettings can't open
+-- (HIGH-F + M-6 fix: validate path before touching the filesystem.)
+function FnsSync:_loadBookFromPath(book_path)
+    if type(book_path) ~= "string" or book_path == "" then
+        return nil, nil, "file_missing"
+    end
+    -- M-6: validate suffix against a whitelist before reading.
+    local suffix = book_path:match("%.([%w]+)$")
+    if not suffix then
+        return nil, nil, "unsupported_format"
+    end
+    suffix = suffix:lower()
+    local SUPPORTED_SUFFIXES = {
+        epub = true, pdf = true, cbz = true, cbr = true, cbt = true,
+        cb7 = true, fb2 = true, mobi = true, azw = true, azw3 = true,
+        djv = true, djvu = true, doc = true, docx = true,
+        txt = true, rtf = true, html = true, htm = true,
+        chm = true, nt = true, pdb = true,
+    }
+    if not SUPPORTED_SUFFIXES[suffix] then
+        return nil, nil, "unsupported_format"
+    end
+    local lfs = require("libs/libkoreader-lfs")
+    if not lfs or lfs.attributes(book_path, "mode") ~= "file" then
+        return nil, nil, "file_missing"
+    end
+    -- M6 review fix (queue miss bug): prefer runtime doc_settings if the
+    -- current book matches. DocSettings:open(book_path) creates a fresh
+    -- instance that reads from the sidecar FILE — but KOreader's runtime
+    -- doc_settings (self.ui.doc_settings, held by ReaderUI since
+    -- readerui.lua:131) has the LATEST annotations in memory, saved via
+    -- readerannotation.lua:251 `self.ui.doc_settings:saveSetting("annotations",
+    -- self.annotations)` but only flushed to disk on closeDocument.
+    -- Reading from file misses any edits the user made since opening the
+    -- book, causing the queue to compute an empty diff and miss the
+    -- user's just-made highlights.
+    local doc_settings
+    if self.ui and self.ui.document and self.ui.document.file == book_path
+        and self.ui.doc_settings then
+        doc_settings = self.ui.doc_settings
+        logger.info("[FNS] _loadBookFromPath: using runtime doc_settings (current book open)")
+    else
+        local DocSettings = require("docsettings")
+        doc_settings = DocSettings:open(book_path)
+        logger.info("[FNS] _loadBookFromPath: using sidecar file (book not currently open)")
+    end
+    local annotations, props
+    local ok, err = pcall(function()
+        annotations = doc_settings:readSetting("annotations") or {}
+        props = doc_settings:readSetting("doc_props") or {}
+    end)
+    if not ok then
+        -- H-3 review fix: readSetting threw → sidecar file is corrupted.
+        -- Retry won't help (Lua chunk parse error is permanent until the
+        -- file is regenerated). Distinct from "field absent" which returns
+        -- nil and goes through annotations={} path. Return corrupted so
+        -- caller drops entry instead of attempts++ loop.
+        logger.warn("[FNS] readSetting failed (sidecar corrupted) for " .. book_path .. ": " .. tostring(err))
+        return nil, nil, "metadata_corrupted"
+    end
+    local meta = {
+        title = props.title or "",
+        author = props.authors or "",
+        language = props.language or "",
+    }
+    local overrides = self.settings.book_overrides or {}
+    local o = overrides[book_path]
+    if o then
+        if o.title and o.title ~= "" then meta.title = o.title end
+        if o.author and o.author ~= "" then meta.author = o.author end
+    end
+    return annotations, meta, nil
+end
+
+--- Process a single queue entry. Independent of _triggerSync (HIGH-B fix):
+-- that path assumes self.ui is valid and reads self.ui.annotation directly.
+-- The queue path may run for a book that's no longer open, so we load
+-- annotations from the book's metadata.lua sidecar instead.
+--
+-- on_complete(success, reason) is invoked when done so the caller can
+-- chain the next entry (HIGH-1 serial fix). reason values:
+--   "synced" / "empty"              success → entry removed
+--   "file_missing" / "unsupported_format"  entry dropped (HIGH-F fix)
+--   "frozen"                        attempts reached MAX → entry frozen
+--   "token_invalid"                 token failed → ALL entries frozen (HIGH-I)
+--   "exception" / "api_failed"      failure → attempts++
+--   "entry_gone"                    entry vanished mid-iteration
+function FnsSync:_processQueueItem(book_path, on_complete)
+    local entry = self.queue[book_path]
+    if not entry then
+        logger.info("[FNS] queue item gone: " .. book_path)
+        if on_complete then on_complete(false, "entry_gone") end
+        return
+    end
+    logger.info(string.format("[FNS] _processQueueItem: path=%s attempts=%d ts=%d",
+        book_path, entry.attempts or 0, entry.ts or 0))
+
+    -- H-1 review fix: re-check _sync_in_flight for the current book.
+    -- _processQueue picked this entry when _sync_in_flight was false, but
+    -- M5 realtime sync (via _triggerSync → nextTick) may have started in
+    -- the window between pick and process. Defer to avoid concurrent
+    -- _doSyncCurrentBook on the same book (data race in Marker.diff).
+    local current_path = self:_getCurrentBookPath()
+    if book_path == current_path and self._sync_in_flight then
+        logger.info("[FNS] _processQueueItem defer (realtime sync in flight): " .. book_path)
+        if on_complete then on_complete(false, "deferred") end
+        return
+    end
+
+    local annotations, meta, load_err = self:_loadBookFromPath(book_path)
+    if load_err == "file_missing" or load_err == "unsupported_format" then
+        -- HIGH-F fix: book file gone/unreadable → drop entry, don't burn attempts.
+        logger.warn(string.format("[FNS] queue drop (%s): %s", load_err, book_path))
+        self.queue[book_path] = nil
+        self:_saveQueue()
+        if on_complete then on_complete(false, load_err) end
+        return
+    end
+    if load_err == "metadata_corrupted" then
+        -- H-3 review fix: sidecar file corrupted (readSetting threw).
+        -- Retry won't help — drop entry. Distinct from "field absent"
+        -- (readSetting returns nil → annotations={}) which goes through
+        -- the empty-annotations path in _doSyncCurrentBook.
+        logger.warn("[FNS] queue drop (sidecar corrupted): " .. book_path)
+        self.queue[book_path] = nil
+        self:_saveQueue()
+        if on_complete then on_complete(false, "metadata_corrupted") end
+        return
+    end
+
+    local note_path = Excerpt:resolvePath(self.settings, meta)
+    logger.info(string.format("[FNS] queue sync start: title=%s annotations=%d path=%s",
+        tostring(meta.title), #annotations, note_path))
+
+    -- H-2 review fix: re-check isOnline before HTTP call.
+    -- _processQueue may have scheduled when online, but network could drop
+    -- by the time we get here (init scheduleIn(2s) race, or long back-off
+    -- retry). Skip without burning attempts — entry stays, will be picked
+    -- up by next onNetworkConnected drain.
+    if not NetworkMgr:isOnline() then
+        logger.info("[FNS] _processQueueItem skip: offline at last mile (no attempt burn)")
+        if on_complete then on_complete(false, "offline") end
+        return
+    end
+
+    -- _doSyncCurrentBook returns a result table (M6). pcall so any
+    -- rendering/marker bug doesn't strand the entry and lock (HIGH-D fix).
+    local ok, result_or_err = pcall(function()
+        return self:_doSyncCurrentBook(annotations, meta, note_path, true)
+    end)
+
+    if not ok then
+        logger.warn("[FNS] queue sync pcall failed: " .. tostring(result_or_err))
+        entry.attempts = (entry.attempts or 0) + 1
+        self:_saveQueue()
+        if on_complete then on_complete(false, "exception") end
+        return
+    end
+
+    local result = result_or_err or {}
+
+    -- HIGH-I fix: token failure → freeze ALL entries + toast.
+    if result.ok == false and result.result
+        and Config.TOKEN_INVALID_CODES[result.result.biz_code] then
+        logger.warn(string.format("[FNS] token invalid (biz_code=%s), freezing queue",
+            tostring(result.result.biz_code)))
+        for _, e in pairs(self.queue) do
+            e.attempts = Config.MAX_RETRY_ATTEMPTS
+        end
+        self:_saveQueue()
+        UIManager:show(InfoMessage:new{
+            text = _("FNS：Token 已失效，请到设置 → 服务连接 → API Token 重填"),
+            timeout = 5,
+        })
+        if on_complete then on_complete(false, "token_invalid") end
+        return
+    end
+
+    if result.ok then
+        logger.info("[FNS] queue sync success: " .. book_path)
+        self.queue[book_path] = nil
+        self:_saveQueue()
+        if on_complete then on_complete(true, "synced") end
+        return
+    end
+
+    -- H-2 fix (review): race condition (another client created the note
+    -- between our getNote and createNote) is NOT a real failure — the note
+    -- exists on server, our highlights are in metadata.lua, next sync will
+    -- diff and apply. Don't burn attempts; treat as success.
+    if result.reason == "race" then
+        logger.info("[FNS] queue race (another client created note): " .. book_path)
+        self.queue[book_path] = nil
+        self:_saveQueue()
+        if on_complete then on_complete(true, "race") end
+        return
+    end
+
+    -- M6 review fix (E failure defense): empty annotations is a legitimate
+    -- "nothing to sync" state (e.g. user deleted all highlights after
+    -- enqueueing). Drop the entry without calling API — guards against
+    -- _doSyncCurrentBook wiping the server-side note.
+    if result.reason == "no_annotations" then
+        logger.info("[FNS] queue drop (no annotations): " .. book_path)
+        self.queue[book_path] = nil
+        self:_saveQueue()
+        if on_complete then on_complete(true, "no_annotations") end
+        return
+    end
+
+    entry.attempts = (entry.attempts or 0) + 1
+    local frozen = entry.attempts >= Config.MAX_RETRY_ATTEMPTS
+    logger.warn(string.format("[FNS] queue sync fail (attempts=%d%s): %s",
+        entry.attempts, frozen and " FROZEN" or "", book_path))
+    self:_saveQueue()
+    if on_complete then on_complete(false, frozen and "frozen" or "api_failed") end
+end
+
+--- Drain the queue: pick the next pending entry and process it serially.
+-- Re-entry guard via _queue_processing (HIGH-2 fix). Serial chain
+-- (HIGH-1 fix): each item's on_complete triggers the next via nextTick.
+-- Skips the currently-open book if it's in the queue (M-5 fix): the
+-- realtime _triggerSync path handles that book, queue should not race.
+function FnsSync:_processQueue()
+    if not self.settings.offline_queue_enabled then
+        logger.dbg("[FNS] _processQueue skip: offline_queue_enabled=false")
+        return
+    end
+    if not self.settings.enabled then
+        logger.dbg("[FNS] _processQueue skip: enabled=false")
+        return
+    end
+    if not self:isConfigured() then
+        logger.dbg("[FNS] _processQueue skip: not configured")
+        return
+    end
+
+    if self._queue_processing then
+        logger.dbg("[FNS] _processQueue skip: already processing")
+        return
+    end
+
+    -- Find next entry: lowest ts among non-frozen entries.
+    -- M-5 fix refined (review A/B failure): only skip the current book
+    -- when realtime sync is actually running (_sync_in_flight=true). If
+    -- realtime path is idle (offline → online transition, queue-only
+    -- flow), we MUST process the current book — otherwise a book enqueued
+    -- while reading it never drains (M5 realtime path is offline-gated).
+    local next_path = nil
+    local next_ts = nil
+    local current_path = self:_getCurrentBookPath()
+    local total, frozen_count, skip_current = 0, 0, 0
+    for path, entry in pairs(self.queue) do
+        total = total + 1
+        if (entry.attempts or 0) >= Config.MAX_RETRY_ATTEMPTS then
+            frozen_count = frozen_count + 1
+        else
+            local skip = (path == current_path and self._sync_in_flight)
+            if skip then
+                skip_current = skip_current + 1
+            elseif next_ts == nil or entry.ts < next_ts then
+                next_ts = entry.ts
+                next_path = path
+            end
+        end
+    end
+    if next_path == nil then
+        logger.info(string.format(
+            "[FNS] _processQueue: nothing to pick (total=%d frozen=%d skip_current=%d)",
+            total, frozen_count, skip_current))
+        return
+    end
+    logger.info(string.format(
+        "[FNS] _processQueue: picked next (total=%d frozen=%d skip_current=%d) path=%s",
+        total, frozen_count, skip_current, next_path))
+
+    self._queue_processing = true
+
+    -- Outer pcall (HIGH-D): if _processQueueItem itself throws before
+    -- reaching its own pcall, release the lock to avoid permanent stall.
+    local ok, err = pcall(function()
+        self:_processQueueItem(next_path, function(success, reason)
+            logger.info(string.format("[FNS] _processQueue callback: success=%s reason=%s",
+                tostring(success), tostring(reason)))
+            self._queue_processing = false
+            if reason == "offline" then
+                -- H-2 review fix: don't back-off retry. Wait for
+                -- onNetworkConnected to trigger next drain (avoid loop).
+                logger.info("[FNS] _processQueue stop: offline, waiting for NetworkConnected")
+                return
+            end
+            if success or reason == "frozen" or reason == "token_invalid"
+                or reason == "entry_gone" or reason == "file_missing"
+                or reason == "unsupported_format" or reason == "metadata_corrupted"
+                or reason == "empty" or reason == "no_annotations" then
+                -- Continue draining remaining entries on next tick.
+                -- H-3 fix: use stable _queue_drain_action so onCloseWidget
+                -- can unschedule.
+                UIManager:nextTick(self._queue_drain_action)
+            else
+                -- deferred / exception / api_failed: back-off before
+                -- retrying to avoid hammering a failing API in a tight
+                -- loop, or to let realtime sync finish first.
+                logger.info("[FNS] _processQueue: back-off 2s before retry")
+                UIManager:scheduleIn(2, self._queue_drain_action)
+            end
+        end)
+    end)
+
+    if not ok then
+        self._queue_processing = false
+        logger.warn("[FNS] _processQueue outer pcall failed: " .. tostring(err))
+    end
+end
+
+--- NetworkConnected event handler (M6).
+-- KOreader broadcasts this when WiFi connects (also at startup if already
+-- online — see networkmanager.lua:154). 1s debounce via os.time() filters
+-- jitter (M-7 fix; os.time granularity makes 100ms target 1s in practice,
+-- which is fine — network events are typically >= 1s apart on Kindle).
+-- scheduleIn(0.5s) lets KOreader internals settle (borrowed from KOSync).
+function FnsSync:onNetworkConnected()
+    logger.info("[FNS] event: onNetworkConnected")
+    local now_s = os.time()
+    if now_s - (self._last_network_event_ts or 0) < 1 then
+        logger.info("[FNS] onNetworkConnected debounced (skip)")
+        return
+    end
+    self._last_network_event_ts = now_s
+    logger.info(string.format("[FNS] onNetworkConnected: scheduleIn(%ss) → _processQueue",
+        tostring(_PROCESS_QUEUE_DELAY)))
+    UIManager:scheduleIn(_PROCESS_QUEUE_DELAY, self._queue_drain_action)
+end
+
+--- NetworkDisconnected event handler (M6 review M-1). Mainly for logging
+-- visibility — no functional action needed (queue stays, will retry on
+-- next onNetworkConnected). Reset _last_network_event_ts so the next
+-- connected event fires immediately (not debounced).
+function FnsSync:onNetworkDisconnected()
+    logger.info("[FNS] event: onNetworkDisconnected")
+    self._last_network_event_ts = 0
+end
+
+--- Document open event (M6 review H-1). Design lists onOpenDocument as one
+-- of the 3 fallback paths to drain the queue, but initial implementation
+-- missed it. Cheap to add — just calls _processQueue.
+function FnsSync:onOpenDocument()
+    logger.info("[FNS] event: onOpenDocument")
+    self:_processQueue()
+end
+
+--- Widget teardown (M6 review H-3). Cancel any pending queue drain
+-- scheduled via _queue_drain_action; otherwise the closure fires after
+-- ReaderUI teardown, operating on a half-destroyed self. Also cancels
+-- M5's auto-sync timer for symmetry.
+-- NOTE (M6 review M-3): _queue_drain_action must only ever be assigned
+-- once in init — never rebind elsewhere, or unschedule here would fail
+-- (UIManager:unschedule matches by reference).
+function FnsSync:onCloseWidget()
+    logger.info("[FNS] event: onCloseWidget (unschedule timers)")
+    if self._queue_drain_action then
+        UIManager:unschedule(self._queue_drain_action)
+    end
+    if self._auto_sync_action then
+        UIManager:unschedule(self._auto_sync_action)
+    end
+end
+
+function FnsSync:onSyncAllHistory()
+    -- TODO M7: walk history dir, batch sync per book, show progress.
+    -- (M6 work is the offline queue above; this is a separate user-triggered
+    -- batch-sync feature for previously-read books.)
+end
+
+-- ===========================================================================
+-- Menu
+-- ===========================================================================
+
+function FnsSync:addToMainMenu(menu_items)
+    -- NOTE: do NOT cache self.settings into a local here.
+    -- onResetConfig replaces self.settings with a fresh table; closures
+    -- capturing a local would keep pointing at the stale one.
+    menu_items.fns_sync = {
+        text = _("FNS 同步"),
+        -- Without sorting_hint, KOreader's MenuSorter treats this item as
+        -- orphaned, prepends "NEW: " and dumps it in the first tab — so the
+        -- user can't find it under Tools where they expect it.
+        sorting_hint = "tools",
+        sub_item_table = {
+            -- Master switch
+            {
+                text = _("启用 FNS 同步"),
+                checked_func = function() return self.settings.enabled end,
+                callback = function() self:_toggleBool("enabled") end,
+                separator = true,
+            },
+
+            -- Auto-sync (M5)
+            {
+                text = _("自动同步"),
+                checked_func = function() return self.settings.auto_sync_enabled end,
+                sub_item_table = {
+                    {
+                        text = _("启用自动同步"),
+                        checked_func = function() return self.settings.auto_sync_enabled end,
+                        callback = function() self:_toggleBool("auto_sync_enabled") end,
+                        separator = true,
+                    },
+                    {
+                        text = _("高亮修改时同步"),
+                        checked_func = function() return self.settings.sync_on_highlight end,
+                        enabled_func = function()
+                            return self.settings.enabled
+                               and self.settings.auto_sync_enabled
+                               and self:isConfigured()
+                        end,
+                        callback = function() self:_toggleBool("sync_on_highlight") end,
+                    },
+                    {
+                        text = _("关闭书籍时同步"),
+                        checked_func = function() return self.settings.sync_on_book_close end,
+                        enabled_func = function()
+                            return self.settings.enabled
+                               and self.settings.auto_sync_enabled
+                               and self:isConfigured()
+                        end,
+                        callback = function() self:_toggleBool("sync_on_book_close") end,
+                    },
+                    {
+                        text = _("同步延迟（秒）"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("debounce_seconds",
+                                _("同步延迟（秒）"),
+                                _("数字，默认 5"))
+                        end,
+                    },
+                },
+                separator = true,
+            },
+
+            -- Offline queue (M6)
+            {
+                -- H-4 fix (review): dynamic text reflects token-failure state.
+                -- If any entry is frozen, prefix [!] so user knows to check.
+                text_func = function()
+                    if not self.queue then return _("离线队列") end
+                    local frozen = 0
+                    for _, e in pairs(self.queue) do
+                        if (e.attempts or 0) >= Config.MAX_RETRY_ATTEMPTS then
+                            frozen = frozen + 1
+                        end
+                    end
+                    if frozen > 0 then
+                        return string.format(_("[!] 离线队列（%d 条已冻结）"), frozen)
+                    end
+                    return _("离线队列")
+                end,
+                checked_func = function() return self.settings.offline_queue_enabled end,
+                enabled_func = function()
+                    return self.settings.enabled and self:isConfigured()
+                end,
+                sub_item_table = {
+                    {
+                        text = _("启用离线队列"),
+                        checked_func = function() return self.settings.offline_queue_enabled end,
+                        callback = function() self:_toggleBool("offline_queue_enabled") end,
+                        separator = true,
+                    },
+                    {
+                        text_func = function()
+                            local n = 0
+                            if self.queue then
+                                for _ in pairs(self.queue) do n = n + 1 end
+                            end
+                            return string.format(_("待同步队列（%d 本）"), n)
+                        end,
+                        enabled_func = function()
+                            if not self.queue then return false end
+                            for _ in pairs(self.queue) do return true end
+                            return false
+                        end,
+                        callback = function()
+                            local lines = {}
+                            for path, entry in pairs(self.queue) do
+                                local title = entry.title or path:match("[^/\\]+$") or path
+                                local status = (entry.attempts or 0) >= Config.MAX_RETRY_ATTEMPTS
+                                    and _("  [已冻结]")
+                                    or string.format(_("  [失败 %d 次]"), entry.attempts or 0)
+                                table.insert(lines, "📖 " .. title .. status)
+                            end
+                            UIManager:show(InfoMessage:new{
+                                text = table.concat(lines, "\n"),
+                                timeout = 5,
+                            })
+                        end,
+                    },
+                    {
+                        text = _("重试冻结条目"),
+                        enabled_func = function()
+                            if not self.queue then return false end
+                            for _, e in pairs(self.queue) do
+                                if (e.attempts or 0) >= Config.MAX_RETRY_ATTEMPTS then
+                                    return true
+                                end
+                            end
+                            return false
+                        end,
+                        callback = function()
+                            local reset_count = 0
+                            for _, entry in pairs(self.queue) do
+                                if (entry.attempts or 0) >= Config.MAX_RETRY_ATTEMPTS then
+                                    entry.attempts = 0
+                                    reset_count = reset_count + 1
+                                end
+                            end
+                            if reset_count > 0 then
+                                self:_saveQueue()
+                                UIManager:show(InfoMessage:new{
+                                    text = string.format(_("已重置 %d 条冻结条目，将开始重试"), reset_count),
+                                    timeout = 2,
+                                })
+                                -- HIGH-G fix: process via the protected
+                                -- entry so reset + drain is serialized.
+                                UIManager:scheduleIn(_PROCESS_QUEUE_DELAY, self._queue_drain_action)
+                            end
+                        end,
+                    },
+                    {
+                        text = _("清空队列"),
+                        keep_menu_open = true,
+                        enabled_func = function()
+                            if not self.queue then return false end
+                            for _ in pairs(self.queue) do return true end
+                            return false
+                        end,
+                        callback = function()
+                            local ConfirmBox = require("ui/widget/confirmbox")
+                            local n = 0
+                            for _ in pairs(self.queue) do n = n + 1 end
+                            UIManager:show(ConfirmBox:new{
+                                text = string.format(_("将放弃 %d 本书的待同步状态。\n\n高亮仍保留在书中（metadata.lua），但不会自动同步到 Obsidian。"), n),
+                                ok_text = _("清空"),
+                                cancel_text = _("取消"),
+                                ok_callback = function()
+                                    self.queue = {}
+                                    self:_saveQueue()
+                                    UIManager:show(InfoMessage:new{
+                                        text = _("队列已清空"),
+                                        timeout = 2,
+                                    })
+                                end,
+                            })
+                        end,
+                    },
+                },
+                separator = true,
+            },
+
+            -- Actions
+            {
+                text = _("立即同步当前书"),
+                enabled_func = function()
+                    return self.settings.enabled and self:isConfigured()
+                end,
+                callback = function() self:onSyncCurrentBook() end,
+            },
+            {
+                text = _("立即同步全部历史"),
+                enabled_func = function()
+                    return false  -- TODO M6
+                end,
+                callback = function() self:onSyncAllHistory() end,
+            },
+            {
+                text = _("测试连接"),
+                enabled_func = function() return self:isConfigured() end,
+                callback = function() self:onTestConnection() end,
+            },
+
+            -- Per-book title/author override
+            {
+                text = _("当前书信息"),
+                enabled_func = function() return self:_getCurrentBookPath() ~= nil end,
+                sub_item_table = {
+                    -- Informational: current file name (greyed out, not clickable)
+                    {
+                        text_func = function()
+                            local path = self:_getCurrentBookPath() or ""
+                            local name = path:match("[^/]+$") or path
+                            if name == "" then name = _("(无打开的书)") end
+                            return "📁 " .. name
+                        end,
+                        enabled_func = function() return false end,
+                    },
+                    -- Edit title override
+                    {
+                        text_func = function()
+                            local title = self:_getBookMetadata().title
+                            if title == "" then title = _("(未设置)") end
+                            return "📖 " .. _("书名") .. ": " .. title
+                        end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editBookOverride("title", _("自定义书名"))
+                        end,
+                    },
+                    -- Edit author override
+                    {
+                        text_func = function()
+                            local author = self:_getBookMetadata().author
+                            if author == "" then author = _("(未设置)") end
+                            return "✍️ " .. _("作者") .. ": " .. author
+                        end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editBookOverride("author", _("自定义作者"))
+                        end,
+                    },
+                    -- Reset to doc_props
+                    {
+                        text = _("🔄 重置为文件元数据"),
+                        callback = function() self:_clearBookOverride() end,
+                    },
+                },
+                separator = true,
+            },
+
+            -- Settings root
+            {
+                text = _("设置"),
+                sub_item_table = {
+                    -- Service connection
+                    {
+                        text = _("服务连接"),
+                        sub_item_table = {
+                            {
+                                text = _("FNS 服务 URL"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("server_url",
+                                        _("FNS 服务 URL"),
+                                        "https://fns.example.com")
+                                end,
+                            },
+                            {
+                                text = _("API Token"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("api_token",
+                                        _("API Token"),
+                                        _("粘贴 FNS 服务生成的 Token"))
+                                end,
+                            },
+                            {
+                                text = _("Vault 名"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("vault",
+                                        _("Vault 名"),
+                                        _("Obsidian Vault 名称"))
+                                end,
+                            },
+                        },
+                        separator = true,
+                    },
+
+                    -- Note organization
+                    {
+                        text = _("笔记组织"),
+                        sub_item_table = {
+                            {
+                                text = _("笔记路径前缀"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("note_path_prefix",
+                                        _("笔记路径前缀"),
+                                        _("只需文件夹名，例如 KOReader/刘慈欣（无需 / 或 \\ 结尾）"))
+                                end,
+                            },
+                            {
+                                text = _("笔记文件名模板"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("note_filename_template",
+                                        _("笔记文件名模板"),
+                                        _("可用 {title} {author} {language} {year} {date}；/ 表示子文件夹（\\ 会自动转为 /）"))
+                                end,
+                            },
+                            {
+                                text = _("笔记模板"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("note_template",
+                                        _("笔记模板（创建新笔记时使用）"),
+                                        _("完整模板文本，可用 {{VALUE:字段}} 占位符"),
+                                        true)  -- multiline
+                                end,
+                            },
+                        },
+                        separator = true,
+                    },
+
+                    -- Excerpt rendering
+                    {
+                        text = _("摘录渲染"),
+                        sub_item_table = {
+                            {
+                                text = _("显示页码"),
+                                checked_func = function() return self.settings.show_page_number end,
+                                callback = function() self:_toggleBool("show_page_number") end,
+                            },
+                            {
+                                text = _("显示笔记标记"),
+                                checked_func = function() return self.settings.show_note_marker end,
+                                callback = function() self:_toggleBool("show_note_marker") end,
+                            },
+                            {
+                                text = _("章节二级标题"),
+                                checked_func = function() return self.settings.show_chapter_subtitle end,
+                                callback = function() self:_toggleBool("show_chapter_subtitle") end,
+                            },
+                            {
+                                text = _("颜色转 emoji"),
+                                checked_func = function() return self.settings.color_to_emoji end,
+                                callback = function() self:_toggleBool("color_to_emoji") end,
+                            },
+                            {
+                                text = _("自定义摘录模板"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("excerpt_template",
+                                        _("摘录模板"),
+                                        _("可用 {page} {text} {note} {chapter} {datetime} {color}"),
+                                        true)  -- multiline
+                                end,
+                                separator = true,
+                            },
+                        },
+                        separator = true,
+                    },
+
+                    -- Trigger mode
+                    {
+                        text = _("触发模式"),
+                        sub_item_table = {
+                            {
+                                text = _("高亮即同步"),
+                                checked_func = function() return self.settings.sync_on_highlight end,
+                                callback = function() self:_toggleBool("sync_on_highlight") end,
+                            },
+                            {
+                                text = _("开书同步"),
+                                checked_func = function() return self.settings.sync_on_book_open end,
+                                callback = function() self:_toggleBool("sync_on_book_open") end,
+                            },
+                            {
+                                text = _("关书同步"),
+                                checked_func = function() return self.settings.sync_on_book_close end,
+                                callback = function() self:_toggleBool("sync_on_book_close") end,
+                            },
+                            {
+                                text = _("防抖延迟（秒）"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("debounce_seconds",
+                                        _("防抖延迟（秒）"),
+                                        tostring(Config.DEFAULTS.debounce_seconds))
+                                end,
+                                separator = true,
+                            },
+                        },
+                        separator = true,
+                    },
+
+                    -- Advanced
+                    {
+                        text = _("高级"),
+                        sub_item_table = {
+                            {
+                                text = _("重置配置"),
+                                keep_menu_open = true,
+                                callback = function() self:onResetConfig() end,
+                            },
+                            {
+                                text = _("关于"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    UIManager:show(InfoMessage:new{
+                                        text = T(_("FNS Sync\n\nKOreader 高亮/笔记同步到 Obsidian（通过 Fast Note Sync 服务）\n\n状态：%1"),
+                                            self.settings.enabled and _("已启用") or _("未启用")),
+                                    })
+                                end,
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+end
+
+return FnsSync
