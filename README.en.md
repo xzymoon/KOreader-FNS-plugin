@@ -88,6 +88,20 @@ Open **KOreader top menu → Tools → FNS Sync**:
 
 Once enabled, highlight/note edits and book close will trigger auto-sync (5-second debounce by default).
 
+## End-to-End Example
+
+Highlights in KOreader are wrapped as HL@ blocks in Obsidian.
+
+**Rendered view (reading mode)** — what the user actually sees:
+
+![Obsidian rendered view](./docs/obsidian-hl-rendered.png)
+
+**Source view (editing mode)** — HL@ markers and block structure are visible:
+
+![Obsidian source view](./docs/obsidian-hl-source.png)
+
+The areas between blocks are **safe-edit zones** — you can interleave your own thoughts (the non-highlighted text in the screenshots above), and they will be preserved on sync. The interior of HL@ blocks is overwritten on sync, so don't edit inside a block. See [plugin/fns_sync.koplugin/README.md](./plugin/fns_sync.koplugin/README.md) for details.
+
 ## Documentation
 
 For detailed usage (HL@ block structure, Obsidian safe-edit zones, template customization, troubleshooting):

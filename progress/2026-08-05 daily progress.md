@@ -1095,4 +1095,62 @@ git branch -D backup-pre-squash   # 仅当完全确认不需要回滚时
 - 给 README 加 Obsidian HL@ 块的截图（这个 ASCII 不合适，需要真实渲染效果）
 - 给 plugin/fns_sync.koplugin/README.md 也加同样的菜单图（详细文档目前没图）
 
+---
+
+## 夜间追加：README 加 Obsidian HL@ 块截图
+
+### 用户操作
+
+用户截图完成,放在 `C:\Users\xieziyan\Desktop\`：
+- `obsidian-hl-rendered.png` (205K,渲染模式)
+- `obsidian-hl-source.png` (172K,源码模式)
+
+截图内容是《国史大纲》(钱穆著)的同步笔记,属于公开出版学术著作,无隐私问题。
+
+### 执行步骤
+
+1. `cp` 两张图到 `E:/KOreader-FNS-plugin/docs/`
+2. `README.md` 在"## 配置"和"## 文档"之间插入新章节"## 端到端示例"
+3. `README.en.md` 在 "## Configuration" 和 "## Documentation" 之间插入新章节 "## End-to-End Example"
+4. 章节内容:渲染模式截图 + 源码模式截图 + 简短说明(块外安全 / 块内会被覆盖)
+5. 更新本 progress 文档
+6. `git add` + `commit` + `push`
+
+### 章节位置选择
+
+候选三个位置:
+- A. 菜单结构后,配置前 (展示效果优先)
+- B. 配置后,文档前 (配置完成看效果,顺序自然) ✅ 选这个
+- C. 功能后,安装前 (作为功能展示)
+
+选 B 因为读者按"安装 → 菜单 → 配置 → 看效果 → 详细文档"的顺序最自然。
+
+### 图片分析(用 mcp analyze_image)
+
+| 图 | 内容 |
+|---|---|
+| rendered.png | Obsidian 阅读视图,HL@ 块渲染效果,📖 emoji + 页码 + 摘录内容 |
+| source.png | Obsidian 源码视图,`<!-- HL@2026-07-29 13:41:53 -->` marker + 块结构清晰 |
+
+视觉模型对截图描述有一些细节失真(把页码格式描述成"页码: 424:"而不是 `> 📖 第 N 页`),但整体结构清晰,内容无隐私问题,可以直接使用。
+
+### 最终 README 章节顺序(根目录)
+
+```
+1. 标题 + 简介
+2. 功能
+3. 安装
+4. 菜单结构 (ASCII 树状图)
+5. 配置
+6. 端到端示例 (新加,Obsidian 截图)
+7. 文档
+8. 系统要求
+9. 隐私
+10. 反馈与贡献
+11. 赞助 (PayPal + 微信二维码)
+12. 商业授权
+13. License (PolyForm Noncommercial)
+```
+
+
 

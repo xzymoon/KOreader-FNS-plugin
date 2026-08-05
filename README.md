@@ -88,6 +88,20 @@ FNS 同步
 
 启用后，划线 / 改笔记 / 关书时会自动触发同步（默认 5 秒 debounce）。
 
+## 端到端示例
+
+KOreader 里的高亮在 Obsidian 端被包裹成 HL@ 块。
+
+**渲染模式(阅读视图)** — 用户实际看到的效果:
+
+![Obsidian 渲染模式](./docs/obsidian-hl-rendered.png)
+
+**源码模式(编辑视图)** — HL@ marker 和块结构清晰可见:
+
+![Obsidian 源码模式](./docs/obsidian-hl-source.png)
+
+块之间的区域是**安全编辑区**,你可以穿插写自己的感想(如上图中非高亮的文字),同步时会被保留。HL@ 块**内部**则会被同步覆盖,所以不要在块内编辑。详细机制见 [plugin/fns_sync.koplugin/README.md](./plugin/fns_sync.koplugin/README.md)。
+
 ## 文档
 
 详细使用文档（HL@ 块结构、Obsidian 端安全编辑区、模板定制、故障排查）：
