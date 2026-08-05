@@ -21,6 +21,59 @@ Sync highlights and notes from KOreader to Obsidian via the [Fast Note Sync](htt
    - **Other devices** (Android / Desktop / etc.): see the KOreader docs for the plugin path
 3. Restart KOreader
 
+## Menu Structure
+
+Open **KOreader top menu → Tools → FNS Sync**. The menu hierarchy (`[✓]` = on, `[ ]` = off):
+
+```
+FNS Sync
+├─ [✓] Enable FNS Sync
+├────────────────────────
+├─ [✓] Auto Sync
+│   ├─ [✓] Enable Auto Sync
+│   ├─ [✓] Sync on Highlight Edit
+│   ├─ [✓] Sync on Book Close
+│   └─ Sync Delay (seconds)
+├────────────────────────
+├─ [✓] Offline Queue
+│   ├─ [✓] Enable Offline Queue
+│   ├─ Pending Queue (N books)
+│   ├─ Retry Frozen Entries
+│   └─ Clear Queue
+├────────────────────────
+├─ Sync Current Book Now
+├─ Sync All History  (disabled)
+├─ Test Connection
+├─ Current Book Info
+│   ├─ 📁 File name
+│   ├─ 📖 Title: ...
+│   ├─ ✍️ Author: ...
+│   └─ 🔄 Reset to File Metadata
+└─ Settings
+    ├─ Service Connection
+    │   ├─ FNS Service URL
+    │   ├─ API Token
+    │   └─ Vault Name
+    ├─ Note Organization
+    │   ├─ Note Path Prefix
+    │   ├─ Note Filename Template
+    │   └─ Note Template
+    ├─ Excerpt Rendering
+    │   ├─ [✓] Show Page Number
+    │   ├─ [✓] Show Note Marker
+    │   ├─ [✓] Chapter Subtitle
+    │   ├─ [✓] Color to Emoji
+    │   └─ Custom Excerpt Template
+    ├─ Trigger Mode
+    │   ├─ [✓] Sync on Highlight
+    │   ├─ [ ] Sync on Book Open
+    │   ├─ [✓] Sync on Book Close
+    │   └─ Debounce Delay (seconds)
+    └─ Advanced
+        ├─ Reset Config
+        └─ About
+```
+
 ## Configuration
 
 Open **KOreader top menu → Tools → FNS Sync**:

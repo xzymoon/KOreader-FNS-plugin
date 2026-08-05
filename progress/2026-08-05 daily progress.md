@@ -1038,3 +1038,61 @@ git branch -D backup-pre-squash   # 仅当完全确认不需要回滚时
 
 旧仓库的 21 个 commit 历史保留在本地 `backup-pre-squash` 分支，**不推 GitHub**。
 
+---
+
+## 夜间追加：README 加 ASCII 菜单树状图
+
+### 用户提议
+
+"KOreader 的菜单能否直接做成 ASCII 的树状图，因为在 KOreader 里面截图，一个是比较麻烦，还有就是无法展现它的树状。"
+
+### Trade-off 分析
+
+| 维度 | 截图 | ASCII 树状图 |
+|---|---|---|
+| 展示树状层级 | ❌ 一次只能看一层 | ✅ 一目了然 |
+| 跨语言（中英 README）| ❌ 需要截两套 | ✅ 一份代码两种语言都能渲染 |
+| 维护成本 | ❌ 改菜单要重新截 | ✅ 改文本即可 |
+| diff 友好 | ❌ 二进制无法 diff | ✅ 文本 diff 清晰 |
+| 加载速度 | ❌ 图片体积 | ✅ 几 KB 文本 |
+| 真实感 | ✅ 直观 | ❌ 抽象 |
+
+**结论**：菜单结构展示用 ASCII 树状图**比截图更合适**。截图留给"HL@ 块在 Obsidian 里的实际渲染效果"这种需要真实感的场景。
+
+### 决策
+
+- 风格 1（树状，类 Linux `tree` 命令）—— 紧凑、开发者熟悉、跟 GitHub README 整体风格搭
+- 方案 A（中英两份独立图，菜单文字本地化）
+
+### 翻译决策
+
+| 中文 | 英文 |
+|---|---|
+| 立即同步当前书 | Sync Current Book Now |
+| 立即同步全部历史 | Sync All History |
+| 当前书信息 | Current Book Info |
+| 章节二级标题 | Chapter Subtitle |
+| 防抖延迟 | Debounce Delay |
+
+### 改动清单
+
+1. **README.md**：在"## 配置"前加新章节"## 菜单结构"，包含中文 ASCII 树状图
+2. **README.en.md**：在"## Configuration"前加新章节"## Menu Structure"，包含英文 ASCII 树状图
+3. 更新本 progress 文档
+4. `git add` + `commit` + `push`
+
+### 图的结构覆盖
+
+- 顶层 1 项（FNS 同步入口）
+- 第一级 8 项（启用 / 自动同步 / 离线队列 / 立即同步当前书 / 立即同步全部历史 / 测试连接 / 当前书信息 / 设置）
+- 4 层嵌套（FNS 同步 → 设置 → 服务连接 → FNS 服务 URL）
+- toggle 项用 `[✓]` / `[ ]` 表示开/关
+- 子菜单用 `├─` / `└─` 树状字符
+- 分组用 `─────` 分隔线（KOreader 菜单里 `separator = true` 的视觉）
+
+### 后续可选改进
+
+- 给 README 加 Obsidian HL@ 块的截图（这个 ASCII 不合适，需要真实渲染效果）
+- 给 plugin/fns_sync.koplugin/README.md 也加同样的菜单图（详细文档目前没图）
+
+
