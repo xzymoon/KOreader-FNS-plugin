@@ -3,7 +3,7 @@ Item-level marker handling for FNS sync.
 
 Each KOreader highlight is wrapped in an HL@ block in the Obsidian note:
 
-    <!-- HL@<datetime> -->
+    <!-- HL@<datetime> pos0="/body/..." pos1="/body/..." chapter="..." -->
     <excerpt content>
     <!-- /HL@<datetime> -->
 
@@ -12,12 +12,18 @@ serves as a unique key per book). Text between HL@ blocks (or outside any
 HL@ block) is treated as user-authored content and preserved verbatim
 across syncs.
 
+M7 (bidirectional sync): the open marker optionally carries META fields
+(pos0/pos1/chapter) used to re-create highlights on other devices. The
+fields are attached to the segment as `seg.meta` and travel with the HL@
+block. Old notes without these fields parse with `seg.meta = nil`.
+
 Public API:
   - parse(content)                              -> segments
   - serialize(segments)                         -> content
-  - wrapBlock(ts, content)                      -> block string
-  - diff(existing_segments, current_highlights) -> actions
+  - wrapBlock(ts, content, meta)                -> block string
+  - diff(existing_segments, current_highlights, current_meta_map) -> actions
   - applyDiff(existing_segments, actions)       -> new_segments
+  - parseOpenMarkerMeta(open_body)              -> meta table (or nil)
 
 Limitations:
   - HL@ blocks must not be nested. KOreader datetimes are flat per-book, so
@@ -39,10 +45,71 @@ local HL_OPEN_SUFFIX = " -->"
 local HL_CLOSE_PREFIX = "<!-- /HL@"
 local HL_CLOSE_SUFFIX = " -->"
 
+-- Known META keys (M7). Anything else in the open marker is preserved
+-- verbatim on round-trip but ignored by the diff logic.
+local META_KEYS = { "pos0", "pos1", "chapter" }
+
+--- Parse the body of an HL@ open marker (the part between `<!-- HL@` and ` -->`).
+-- Format: `<datetime> [key1="value1" key2="value2" ...]`
+-- datetime is always 19 chars: "YYYY-MM-DD HH:MM:SS".
+-- Returns: ts_string, meta_table_or_nil
+--   meta = { pos0 = "...", pos1 = "...", chapter = "..." } (only keys present in marker)
+-- Parsing is plain-text (no Lua patterns) for safety with XPointer special chars.
+-- On malformed input returns ts only with meta=nil (best effort).
+function Marker.parseOpenMarkerMeta(open_body)
+    if not open_body or #open_body < 19 then return open_body, nil end
+    local ts = string.sub(open_body, 1, 19)
+    -- Everything after ts + separating space (if any) is the META region.
+    local meta = nil
+    if #open_body >= 21 then
+        local rest = string.sub(open_body, 21)  -- skip "YYYY-MM-DD HH:MM:SS "
+        local i = 1
+        while i <= #rest do
+            -- Find next `="`
+            local eq_pos = string.find(rest, "=\"", i, true)
+            if not eq_pos then break end
+            local key = string.sub(rest, i, eq_pos - 1)
+            -- Trim trailing whitespace from key (in case of double-space)
+            key = key:gsub("^%s+", ""):gsub("%s+$", "")
+            local value_start = eq_pos + 2
+            local value_end = string.find(rest, "\"", value_start, true)
+            if not value_end then break end  -- malformed; bail
+            local value = string.sub(rest, value_start, value_end - 1)
+            if key ~= "" then
+                meta = meta or {}
+                meta[key] = value
+            end
+            -- Move past `" ` (closing quote + space). If at end of string, break.
+            i = value_end + 1
+            if i > #rest then break end
+            -- Skip the single space separator
+            if string.sub(rest, i, i) == " " then i = i + 1 end
+        end
+    end
+    return ts, meta
+end
+
+--- Serialize a meta table back into open-marker body fragment.
+-- Returns string like ` pos0="/body/..." pos1="/body/..." chapter="..."`
+-- (with leading space), or empty string if meta is nil/empty.
+-- Only serializes known META_KEYS to avoid round-trip drift from random input.
+local function serializeMeta(meta)
+    if not meta then return "" end
+    local parts = {}
+    for _, key in ipairs(META_KEYS) do
+        local v = meta[key]
+        if v ~= nil and v ~= "" then
+            table.insert(parts, key .. "=\"" .. tostring(v) .. "\"")
+        end
+    end
+    if #parts == 0 then return "" end
+    return " " .. table.concat(parts, " ")
+end
+
 --- Parse notebook content into a list of segments.
 -- Each segment is either:
---   { type = "user", content = "..." }              -- user-authored text (verbatim)
---   { type = "hl", ts = "...", content = "..." }    -- KOreader highlight block
+--   { type = "user", content = "..." }                              -- user text (verbatim)
+--   { type = "hl", ts = "...", content = "...", meta = {...}|nil }  -- KOreader highlight block
 --
 -- Malformed HL@ blocks (missing close marker, missing " -->") are treated as
 -- user content (preserved verbatim, not lost).
@@ -73,7 +140,13 @@ function Marker.parse(content)
             table.insert(segments, { type = "user", content = rest })
             break
         end
-        local ts = string.sub(content, open_start + #HL_OPEN_PREFIX, open_suffix_pos - 1)
+        local open_body = string.sub(content, open_start + #HL_OPEN_PREFIX, open_suffix_pos - 1)
+        -- M7: parse ts + optional meta fields. ts is the first 19 chars,
+        -- the rest (if any) is `key="value"` META pairs. We use the ts
+        -- from parseOpenMarkerMeta because the META region uses spaces as
+        -- separators and XPointer values may contain "[" "]" "(" ")" "."
+        -- but NOT spaces (verified from KOreader readerlink.lua samples).
+        local ts, meta = Marker.parseOpenMarkerMeta(open_body)
 
         -- Find matching close marker "<!-- /HL@<ts> -->"
         local close_marker = HL_CLOSE_PREFIX .. ts .. HL_CLOSE_SUFFIX
@@ -97,7 +170,9 @@ function Marker.parse(content)
         raw_block = raw_block:gsub("\n%s*>%s*$", "")
         local trimmed = raw_block:gsub("^%s+", ""):gsub("%s+$", "")
 
-        table.insert(segments, { type = "hl", ts = ts, content = trimmed })
+        local seg = { type = "hl", ts = ts, content = trimmed }
+        if meta then seg.meta = meta end
+        table.insert(segments, seg)
 
         i = close_pos + #close_marker
     end
@@ -108,8 +183,8 @@ end
 --- Wrap a single highlight's content in HL@ markers.
 -- Centralizes the block format so serialize (diff path for existing notes)
 -- and external callers like renderFullNote (new note creation path) produce
--- identical output. Format:
---   <!-- HL@<ts> -->
+-- identical output. Format (M7 with optional meta):
+--   <!-- HL@<ts> pos0="/body/..." pos1="/body/..." chapter="..." -->
 --   <content>
 --
 --   <!-- /HL@<ts> -->
@@ -121,9 +196,11 @@ end
 -- @param ts string  highlight datetime (unique key per book)
 -- @param content string  rendered excerpt body (should be trimmed of
 --                        trailing newlines; renderExcerpt already does this)
+-- @param meta table|nil  optional M7 meta { pos0, pos1, chapter } attached
+--                        to the open marker for cross-device sync
 -- @return string  wrapped block (head + body + blank line + close)
-function Marker.wrapBlock(ts, content)
-    return HL_OPEN_PREFIX .. ts .. HL_OPEN_SUFFIX .. "\n"
+function Marker.wrapBlock(ts, content, meta)
+    return HL_OPEN_PREFIX .. ts .. serializeMeta(meta) .. HL_OPEN_SUFFIX .. "\n"
         .. content .. "\n\n"
         .. HL_CLOSE_PREFIX .. ts .. HL_CLOSE_SUFFIX
 end
@@ -134,6 +211,8 @@ end
 -- separator — gives a clear visual boundary in the source .md file between
 -- distinct highlights. (Markdown rendering collapses consecutive blank
 -- lines to a single paragraph break, so rendered view still shows one gap.)
+-- M7: preserves seg.meta through round-trip (writes pos0/pos1/chapter into
+-- the open marker).
 function Marker.serialize(segments)
     local parts = {}
     for i, seg in ipairs(segments) do
@@ -143,7 +222,7 @@ function Marker.serialize(segments)
             if i > 1 and segments[i - 1].type == "hl" then
                 table.insert(parts, "\n\n\n")  -- two blank lines in source
             end
-            table.insert(parts, Marker.wrapBlock(seg.ts, seg.content))
+            table.insert(parts, Marker.wrapBlock(seg.ts, seg.content, seg.meta))
         end
     end
     return table.concat(parts)
@@ -152,8 +231,14 @@ end
 --- Compute diff between existing note segments and current KOreader highlights.
 -- @param existing_segments  result of parse(existing note content)
 -- @param current_highlights  table { ts -> rendered_content } from excerpt.lua
--- @return actions list: { {op="insert"|"delete"|"update", ts=..., content=...}, ... }
-function Marker.diff(existing_segments, current_highlights)
+-- @param current_meta_map    optional (M7) table { ts -> meta } from local
+--                            annotations; attaches meta to insert/update actions
+--                            so the new HL@ block carries pos0/pos1/chapter
+--                            for cross-device sync.
+-- @return actions list: { {op="insert"|"delete"|"update", ts=..., content=..., meta=...?}, ... }
+function Marker.diff(existing_segments, current_highlights, current_meta_map)
+    current_meta_map = current_meta_map or {}
+
     local existing_ts = {}
     for _, seg in ipairs(existing_segments) do
         if seg.type == "hl" then
@@ -166,7 +251,9 @@ function Marker.diff(existing_segments, current_highlights)
     -- Inserts: in current but not in existing
     for ts, content in pairs(current_highlights) do
         if existing_ts[ts] == nil then
-            table.insert(actions, { op = "insert", ts = ts, content = content })
+            local action = { op = "insert", ts = ts, content = content }
+            if current_meta_map[ts] then action.meta = current_meta_map[ts] end
+            table.insert(actions, action)
         end
     end
 
@@ -176,7 +263,11 @@ function Marker.diff(existing_segments, current_highlights)
             if current_highlights[seg.ts] == nil then
                 table.insert(actions, { op = "delete", ts = seg.ts })
             elseif current_highlights[seg.ts] ~= seg.content then
-                table.insert(actions, { op = "update", ts = seg.ts, content = current_highlights[seg.ts] })
+                -- M7: update carries meta — prefer new (from current_meta_map)
+                -- if user re-rendered, else preserve existing seg.meta.
+                local action = { op = "update", ts = seg.ts, content = current_highlights[seg.ts] }
+                action.meta = current_meta_map[seg.ts] or seg.meta
+                table.insert(actions, action)
             end
         end
     end
