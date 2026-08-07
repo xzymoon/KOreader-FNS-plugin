@@ -728,22 +728,22 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
 end
 
 --- Bidirectional sync (M7): three-way merge with pull.
--- One sync round = atomic unit (per design v4 H-A2, see progress 2026-08-06):
+-- One sync round = atomic unit (per design v4 H-A2 + M7 Day 3 architect H-1):
 --   1. GET server note → parse → server_segments (each hl seg carries seg.meta)
 --   2. local annotations → local_ts_set + current_meta_map (pos0/pos1/chapter)
 --   3. load last_synced[book_path]
 --   4. Threeway.computeActions → {insert_on_server, delete_on_server,
 --      insert_on_local, delete_on_local}
 --   5. apply server-side actions via Marker.applyDiff → new_server_content
---   6. apply local-side actions:
---      - insert_on_local: extract text via getTextFromXPointers, validate
---        against seg.content (substring), addItem (suppressed dispatch via
---        _pull_in_flight)
---      - delete_on_local: direct table.remove (no dispatch)
+--   6. extract text + validate (defer local mutation to step 8)
 --   7. overwriteNote(new_server_content)
---   8. on success: update last_synced = new_server_ts ∪ successfully_added_local_ts
---   9. dispatch AnnotationsModified ONCE with cause="remote_pull"
---  10. toast with stats
+--   8. on server-write success: apply local actions
+--      - addItem for each validated insert_on_local
+--      - direct table.remove for delete_on_local (no dispatch)
+--      (server-write failure discards items_to_add → retry is idempotent)
+--   9. update last_synced = new_server_ts ∪ successfully_added_local_ts
+--  10. dispatch AnnotationsModified ONCE with cause="remote_pull"
+--  11. toast with stats
 --
 -- Version-mismatch policy (user decision 2026-08-07, see memory
 -- project-m7-version-mismatch): when extracted text doesn't substring-match
@@ -954,16 +954,18 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
     local new_server_segments = Marker.applyDiff(server_segments, marker_actions)
     local new_server_content = Marker.serialize(new_server_segments)
 
-    -- Step 9: apply local-side actions (the "pull" direction).
-    local n_inserted_local = 0
-    local n_deleted_local = 0
+    -- Step 9: extract text + validate (DEFER local mutation to Step 11).
+    -- architect H-1 fix (M7 Day 3 review): split extract from apply so
+    -- overwriteNote failure leaves local state untouched → retry is
+    -- idempotent. addItem/table.remove are postponed to Step 11.
+    local items_to_add = {}      -- list of { ts=..., item=... } (validated)
+    local indices_to_remove = {} -- desc-sorted indices into annotations
     local n_skip_no_meta = 0
     local n_skip_text_empty = 0
     local n_skip_text_mismatch = 0
-    local n_skip_failed = 0
-    local successfully_added_local_ts = {}
+    -- n_skip_failed + n_inserted_local + n_deleted_local computed in Step 11
+    -- (addItem can still fail even after validation passes).
 
-    self._pull_in_flight = true
     if can_pull then
         for _, ts in ipairs(actions.insert_on_local) do
             local seg = server_seg_by_ts[ts]
@@ -1003,7 +1005,8 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
                     -- Substring check fails: extracted text not in server's markdown
                     -- content → book version differs between devices (XPointer landed
                     -- on different text). Skip + warn; don't count into last_synced
-                    -- so next round retries. (M8 will add text-search fallback.)
+                    -- so next round retries. (M8 will add text-search fallback, see
+                    -- memory project-m7-version-mismatch.)
                     -- Privacy: log extracted LENGTH only, not content (extracted is
                     -- user's actual highlighted text, may be sensitive). server
                     -- content is the markdown we wrote, less sensitive, head 40 OK.
@@ -1014,26 +1017,20 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
                         #tostring(extracted),
                         tostring(seg.content):sub(1, 40)))
                 else
-                    local item = {
-                        page = meta.pos0,        -- rolling mode: XPointer start
-                        pos0 = meta.pos0,
-                        pos1 = meta.pos1,
-                        text = extracted,
-                        chapter = chapter,       -- validated/cleared above
-                        drawer = "lighten",      -- default highlight style; M8 may sync this
-                        datetime = ts,
-                    }
-                    local ok, idx_or_err = pcall(function()
-                        return self.ui.annotation:addItem(item)
-                    end)
-                    if ok and idx_or_err then
-                        n_inserted_local = n_inserted_local + 1
-                        successfully_added_local_ts[ts] = true
-                    else
-                        n_skip_failed = n_skip_failed + 1
-                        logger.warn("[FNS] pull insert addItem failed: ts=" .. tostring(ts)
-                            .. " err=" .. tostring(idx_or_err))
-                    end
+                    -- Defer addItem to Step 11 (after server write succeeds).
+                    -- Stash the item + its ts together for the apply phase.
+                    table.insert(items_to_add, {
+                        ts = ts,
+                        item = {
+                            page = meta.pos0,    -- rolling mode: XPointer start
+                            pos0 = meta.pos0,
+                            pos1 = meta.pos1,
+                            text = extracted,
+                            chapter = chapter,   -- validated/cleared above
+                            drawer = "lighten",  -- default; M8 may sync this
+                            datetime = ts,
+                        },
+                    })
                 end
             end
         end
@@ -1044,29 +1041,30 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
         end
     end
 
-    -- delete_on_local: direct table.remove (NOT removeItemByIndex, which would
-    -- dispatch AnnotationsModified without cause=remote_pull → M5 self-loop).
+    -- delete_on_local: build indices_to_remove list. Actual table.remove
+    -- deferred to Step 11 (same atomicity rationale as items_to_add).
+    -- At apply time we'll use direct table.remove (NOT removeItemByIndex,
+    -- which would dispatch AnnotationsModified without cause=remote_pull →
+    -- M5 self-loop).
     if #actions.delete_on_local > 0 then
         local delete_ts_set = {}
         for _, ts in ipairs(actions.delete_on_local) do
             delete_ts_set[ts] = true
         end
-        local indices_to_remove = {}
         for i, ann in ipairs(self.ui.annotation.annotations) do
             if ann.datetime and delete_ts_set[ann.datetime] then
                 table.insert(indices_to_remove, i)
             end
         end
-        -- Sort descending so removal doesn't shift not-yet-processed indices.
+        -- Sort descending so removal doesn't shift not-yet-processed indices
+        -- (matters at apply time in Step 11).
         table.sort(indices_to_remove, function(a, b) return a > b end)
-        for _, idx in ipairs(indices_to_remove) do
-            table.remove(self.ui.annotation.annotations, idx)
-            n_deleted_local = n_deleted_local + 1
-        end
     end
-    self._pull_in_flight = false
 
     -- Step 10: overwriteNote.
+    -- NOW commit server-side. If this fails, items_to_add + indices_to_remove
+    -- are discarded and local state is unchanged → next round retries
+    -- idempotently (architect H-1/H-2 fix, M7 Day 3 review).
     -- original_ctime: pass 0 (not nil) when missing — overwriteNote's nil
     -- semantics are unclear, 0 means "no ctime to preserve" universally
     -- (code-reviewer M-3, M7 Day 3 review).
@@ -1077,7 +1075,39 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
         return { ok = false, reason = "overwrite_failed", result = post_result }
     end
 
-    -- Step 11: update last_synced = new_server_ts ∪ successfully_added_local_ts.
+    -- Step 11: apply local actions (deferred from Step 9). NOW mutate local.
+    -- _pull_in_flight suppresses onAnnotationsModified during the addItem
+    -- batch (each addItem → AnnotationsModified → M5 debounce would fire
+    -- mid-pull without this guard). Released before Step 12 dispatch so
+    -- the cause="remote_pull" event we send is the only one M5 sees.
+    self._pull_in_flight = true
+    local n_inserted_local = 0
+    local n_deleted_local = 0
+    local n_skip_failed = 0
+    local successfully_added_local_ts = {}
+
+    for _, entry in ipairs(items_to_add) do
+        local ok, idx_or_err = pcall(function()
+            return self.ui.annotation:addItem(entry.item)
+        end)
+        if ok and idx_or_err then
+            n_inserted_local = n_inserted_local + 1
+            successfully_added_local_ts[entry.ts] = true
+        else
+            n_skip_failed = n_skip_failed + 1
+            logger.warn("[FNS] pull insert addItem failed: ts=" .. tostring(entry.ts)
+                .. " err=" .. tostring(idx_or_err))
+        end
+    end
+
+    -- delete_on_local: direct table.remove (NOT removeItemByIndex).
+    for _, idx in ipairs(indices_to_remove) do
+        table.remove(self.ui.annotation.annotations, idx)
+        n_deleted_local = n_deleted_local + 1
+    end
+    self._pull_in_flight = false
+
+    -- Step 12: update last_synced = new_server_ts ∪ successfully_added_local_ts.
     -- new_server_ts = (server_ts ∪ insert_on_server) - delete_on_server.
     --
     -- CRITICAL: skipped local inserts are NOT counted. If we counted them,
@@ -1104,7 +1134,7 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
     for ts in pairs(successfully_added_local_ts) do new_last[ts] = true end
     self:_saveLastSyncedSet(path, new_last)
 
-    -- Step 12: dispatch AnnotationsModified ONCE with cause="remote_pull".
+    -- Step 13: dispatch AnnotationsModified ONCE with cause="remote_pull".
     -- Other listeners (footer / bookmark view) get the update; M5 debounce
     -- explicitly skips this cause (see onAnnotationsModified).
     if n_inserted_local > 0 or n_deleted_local > 0 then
@@ -1114,7 +1144,7 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
         }))
     end
 
-    -- Step 13: log + toast
+    -- Step 14: log + toast
     local n_skip_total = n_skip_no_meta + n_skip_text_empty + n_skip_text_mismatch + n_skip_failed
     logger.info(string.format(
         "[FNS] bidirectional sync success at %s: +local=%d -local=%d +server=%d -server=%d skip=%d(no_meta=%d empty=%d mismatch=%d failed=%d)",
