@@ -557,9 +557,25 @@ function FnsSync:_triggerSync(opts)
             local ok, err = pcall(function()
                 self:_doSyncCurrentBook(annotations, meta, path, silent)
             end)
+            -- Finally block: reset BOTH locks regardless of pcall outcome.
+            -- _sync_in_flight protects this entry; _pull_in_flight is set
+            -- inside Bidirectional Step 9 and MUST be released even if
+            -- getTextFromXPointers / addItem / overwriteNote throws —
+            -- otherwise onAnnotationsModified permanently skips M5 debounce
+            -- (silent-failure-hunter H-1, found in M7 Day 3 review).
             self._sync_in_flight = false
+            self._pull_in_flight = false
             if not ok then
                 logger.warn("[FNS] sync pcall failed: " .. tostring(err))
+                -- silent=false (manual button) path: tell user something went
+                -- wrong instead of leaving them with a vanishing spinner
+                -- (silent-failure-hunter L-1).
+                if not silent then
+                    UIManager:show(InfoMessage:new{
+                        text = _("同步内部错误，详见 crash.log（grep [FNS]）"),
+                        timeout = 5,
+                    })
+                end
             end
         end)
     end
@@ -741,6 +757,19 @@ end
 function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent)
     annotations = annotations or {}
 
+    -- M7 Day 3 review (security-reviewer H-1): XPointer format validation.
+    -- Real XPointers from crengine look like "/body/DocFragment/.../p[3]/text()[2].123"
+    -- (per readerlink.lua samples). Whitelist: leading "/" + alphanumeric +
+    -- "/ . [ ] ( ) _ -" only. Rejects strings with quotes, angle brackets,
+    -- spaces, etc. — defends against attacker-controlled META fields in
+    -- Obsidian vault (could otherwise break marker parsing or feed garbage
+    -- to crengine's getTextFromXPointers).
+    local function isValidXPointer(xp)
+        return type(xp) == "string"
+            and #xp > 0 and #xp <= Config.MAX_XPOINTER_LEN
+            and xp:find("^/[%w_%-%./%[%]()]+$") ~= nil
+    end
+
     -- can_pull gates the entire local-insert phase. paging mode (PDF etc.)
     -- has no XPointer, getTextFromXPointers doesn't apply — skip pull only.
     local can_pull = self.ui and self.ui.rolling == true
@@ -810,7 +839,22 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
         return { ok = false, reason = "create_unknown", result = create_result }
     end
 
-    -- Step 5: parse server content → server_segments + lookup maps
+    -- Step 5: parse server content → server_segments + lookup maps.
+    -- Security gate (M7 Day 3 security-reviewer H-2): reject notes larger
+    -- than Config.MAX_NOTE_BYTES — attacker-controlled vault could otherwise
+    -- send a multi-MB note that blocks KOreader UI for seconds during parse.
+    if #get_result.content > Config.MAX_NOTE_BYTES then
+        logger.warn(string.format("[FNS] server note too large (%d bytes > %d), refusing to sync",
+            #get_result.content, Config.MAX_NOTE_BYTES))
+        if not silent then
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("服务器笔记过大（%d KB），跳过同步以免 UI 卡顿"),
+                    math.floor(#get_result.content / 1024)),
+                timeout = 5,
+            })
+        end
+        return { ok = false, reason = "note_too_large" }
+    end
     local server_segments = Marker.parse(get_result.content)
     local server_ts_set = {}
     local server_seg_by_ts = {}
@@ -878,6 +922,19 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
         logger.dbg("[FNS] threeway delete_on_server=" .. sorted_list(actions.delete_on_server))
         logger.dbg("[FNS] threeway insert_on_local=" .. sorted_list(actions.insert_on_local))
         logger.dbg("[FNS] threeway delete_on_local=" .. sorted_list(actions.delete_on_local))
+        -- silent-failure-hunter M-3: surface "impossible / corrupt last" ts list
+        -- (in last but not in server nor local). Non-empty suggests last_synced
+        -- state corruption (e.g. partial settings flush after crash).
+        local impossible = {}
+        for ts in pairs(last_ts_set) do
+            if not server_ts_set[ts] and not local_ts_set[ts] then
+                table.insert(impossible, ts)
+            end
+        end
+        if #impossible > 0 then
+            table.sort(impossible)
+            logger.dbg("[FNS] threeway impossible_ts (in last only)=" .. "[" .. table.concat(impossible, "|") .. "]")
+        end
     end
 
     -- Step 8: apply server-side actions → new_server_content.
@@ -910,14 +967,33 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
     if can_pull then
         for _, ts in ipairs(actions.insert_on_local) do
             local seg = server_seg_by_ts[ts]
-            if not seg or not seg.meta or not seg.meta.pos0 or not seg.meta.pos1 then
+            local meta = seg and seg.meta
+            -- M7 Day 3 review (security-reviewer H-1): XPointer format gate.
+            -- Rejects server-provided META values that don't match real
+            -- crengine XPointer shape (defends against attacker-controlled
+            -- vault + accidental format corruption).
+            if not meta or not isValidXPointer(meta.pos0) or not isValidXPointer(meta.pos1) then
                 n_skip_no_meta = n_skip_no_meta + 1
-                logger.warn("[FNS] pull insert skipped (server seg has no meta, old note?): ts=" .. tostring(ts))
+                logger.warn(string.format(
+                    "[FNS] pull insert skipped (no meta or invalid XPointer): ts=%s pos0_len=%d pos1_len=%d",
+                    tostring(ts),
+                    meta and #tostring(meta.pos0) or 0,
+                    meta and #tostring(meta.pos1) or 0))
             else
+                -- M7 Day 3 review (security-reviewer M-2): chapter length + content gate.
+                -- Defends against metadata.lua injection via overly-long or newline-
+                -- bearing chapter strings (which would corrupt KOreader sidecar).
+                local chapter = meta.chapter
+                if chapter ~= nil and (type(chapter) ~= "string"
+                                        or #chapter > Config.MAX_CHAPTER_LEN
+                                        or chapter:find("[\r\n]")) then
+                    logger.warn("[FNS] pull insert: chapter field invalid (too long or has newline), clearing. ts=" .. tostring(ts))
+                    chapter = nil
+                end
                 -- Truncate XPointer in logs (progress v4 L-C2 DEBUG hygiene).
-                local pos0_str = tostring(seg.meta.pos0)
-                local pos1_str = tostring(seg.meta.pos1)
-                local extracted = self.ui.document:getTextFromXPointers(seg.meta.pos0, seg.meta.pos1)
+                local pos0_str = tostring(meta.pos0)
+                local pos1_str = tostring(meta.pos1)
+                local extracted = self.ui.document:getTextFromXPointers(meta.pos0, meta.pos1)
                 if extracted == nil or extracted == "" then
                     n_skip_text_empty = n_skip_text_empty + 1
                     logger.warn(string.format(
@@ -928,19 +1004,22 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
                     -- content → book version differs between devices (XPointer landed
                     -- on different text). Skip + warn; don't count into last_synced
                     -- so next round retries. (M8 will add text-search fallback.)
+                    -- Privacy: log extracted LENGTH only, not content (extracted is
+                    -- user's actual highlighted text, may be sensitive). server
+                    -- content is the markdown we wrote, less sensitive, head 40 OK.
                     n_skip_text_mismatch = n_skip_text_mismatch + 1
                     logger.warn(string.format(
-                        "[FNS] pull insert skipped (text mismatch, version diff?): ts=%s extracted_head=%q server_content_head=%q",
+                        "[FNS] pull insert skipped (text mismatch, version diff?): ts=%s extracted_len=%d server_content_head=%q",
                         tostring(ts),
-                        tostring(extracted):sub(1, 40),
+                        #tostring(extracted),
                         tostring(seg.content):sub(1, 40)))
                 else
                     local item = {
-                        page = seg.meta.pos0,    -- rolling mode: XPointer start
-                        pos0 = seg.meta.pos0,
-                        pos1 = seg.meta.pos1,
+                        page = meta.pos0,        -- rolling mode: XPointer start
+                        pos0 = meta.pos0,
+                        pos1 = meta.pos1,
                         text = extracted,
-                        chapter = seg.meta.chapter,
+                        chapter = chapter,       -- validated/cleared above
                         drawer = "lighten",      -- default highlight style; M8 may sync this
                         datetime = ts,
                     }
@@ -987,8 +1066,11 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
     end
     self._pull_in_flight = false
 
-    -- Step 10: overwriteNote
-    local original_ctime = get_result.note and get_result.note.ctime
+    -- Step 10: overwriteNote.
+    -- original_ctime: pass 0 (not nil) when missing — overwriteNote's nil
+    -- semantics are unclear, 0 means "no ctime to preserve" universally
+    -- (code-reviewer M-3, M7 Day 3 review).
+    local original_ctime = (get_result.note and get_result.note.ctime) or 0
     local post_result = Api:overwriteNote(self.settings, path, new_server_content, original_ctime)
     if not post_result.ok then
         if not silent then self:_showSyncError(post_result) end
@@ -1064,8 +1146,22 @@ end
 --- _triggerSync with the bidirectional gate already on. The button label
 --- emphasizes "pull" because that's the user-visible new capability, but it
 --- always also pushes local-new highlights to server.
-function FnsSync:_pullRemoteHighlights()
-    logger.info("[FNS] event: _pullRemoteHighlights (manual button or scheduled pull)")
+--- "Pull remote highlights" button entry + onOpenDocument scheduled entry (M7).
+-- Per design v4 H-A2, pull and push are inseparable (one sync round), so this
+-- is a thin wrapper around _triggerSync with the bidirectional gate already on.
+-- The button label emphasizes "pull" because that's the user-visible new
+-- capability, but it always also pushes local-new highlights to server.
+--
+-- @param manual bool|nil  true = user pressed button (override concurrent
+--   guard like onSyncCurrentBook). false/nil = auto-scheduled from
+--   onOpenDocument's scheduleIn(2s) — DON'T override, defer to close-document
+--   fallback if M5 realtime is in flight.
+--   M7 Day 3 review (architect H-3): scheduled pull forcing the lock would
+--   preempt M5's debounce window, silently dropping a just-made highlight's
+--   push until next user action. Manual override is fine (explicit user
+--   intent); auto paths must respect the existing lock.
+function FnsSync:_pullRemoteHighlights(manual)
+    logger.info("[FNS] event: _pullRemoteHighlights (" .. (manual and "manual" or "scheduled") .. ")")
     if not self.settings.bidirectional_sync_enabled then
         -- Defensive: button is hidden when toggle is off (Day 2b menu), but
         -- pull_on_book_open scheduled task could fire if user toggled off
@@ -1074,17 +1170,28 @@ function FnsSync:_pullRemoteHighlights()
         return
     end
     if not self:isConfigured() then
-        UIManager:show(InfoMessage:new{ text = _("请先配置服务 URL / Token / Vault") })
+        if manual then
+            UIManager:show(InfoMessage:new{ text = _("请先配置服务 URL / Token / Vault") })
+        else
+            logger.info("[FNS] pull skipped: not configured")
+        end
         return
     end
     if self._sync_in_flight then
-        logger.info("[FNS] pull skipped: another sync in flight")
-        return
+        if manual then
+            -- User-initiated: override guard like onSyncCurrentBook.
+            logger.info("[FNS] pull: manual override, clearing in-flight lock")
+            self._sync_in_flight = false
+        else
+            -- Scheduled: don't override. M5 debounce or another sync is running.
+            -- Defer to close-document fallback (sync_on_book_close) or next
+            -- manual trigger.
+            logger.info("[FNS] pull skipped (scheduled): another sync in flight, will retry on close-document")
+            return
+        end
     end
     -- _triggerSync will route to _doSyncCurrentBookBidirectional via dispatcher
-    -- (bidirectional_sync_enabled is true here). Force-clear in-flight lock
-    -- like onSyncCurrentBook does — manual intent overrides concurrent guard.
-    self._sync_in_flight = false
+    -- (bidirectional_sync_enabled is true here).
     self:_triggerSync{ silent = false }
 end
 
@@ -1632,6 +1739,13 @@ function FnsSync:onCloseWidget()
     if self._pull_action then
         UIManager:unschedule(self._pull_action)
     end
+    -- M7 Day 3 review (code-reviewer M-4 + architect H-3 composite):
+    -- defensively reset _pull_in_flight. If a pull was mid-flight when the
+    -- user closed the book, the in-progress closure will be pcall-caught
+    -- by _triggerSync's finally block — but if some path bypasses that
+    -- (rare race), this defensive reset ensures M5 debounce isn't
+    -- permanently silenced after teardown.
+    self._pull_in_flight = false
 end
 
 function FnsSync:onSyncAllHistory()
@@ -1886,7 +2000,7 @@ function FnsSync:addToMainMenu(menu_items)
                        and self:isConfigured()
                        and self.settings.bidirectional_sync_enabled
                 end,
-                callback = function() self:_pullRemoteHighlights() end,
+                callback = function() self:_pullRemoteHighlights(true) end,
             },
             {
                 text = _("立即同步全部历史"),

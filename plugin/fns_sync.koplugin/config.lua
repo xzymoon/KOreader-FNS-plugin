@@ -85,6 +85,19 @@ Config.DEFAULT_COLOR_EMOJI_MAP = {
 -- auto-retried; user must manually retry or clear from the queue menu).
 Config.MAX_RETRY_ATTEMPTS = 5
 
+-- M7 Day 3 review (security-reviewer H-1/H-2): bounds to defend against
+-- attacker-controlled vault content. Real-world references:
+--   - MAX_NOTE_BYTES: typical Obsidian note < 100 KB; 1 MB is generous cap
+--     that catches pathologically large or malicious notes without
+--     blocking legitimate use.
+--   - MAX_XPOINTER_LEN: real KOreader XPointers are < 200 chars (crengine
+--     DOM path). 256 is generous; reject longer to prevent resource abuse.
+--   - MAX_CHAPTER_LEN: chapter titles are typically < 50 chars; 256 is a
+--     safety net against metadata.lua injection.
+Config.MAX_NOTE_BYTES    = 1024 * 1024  -- 1 MB
+Config.MAX_XPOINTER_LEN  = 256
+Config.MAX_CHAPTER_LEN   = 256
+
 -- FNS business codes indicating token failure. When _processQueueItem sees
 -- any of these in the result, it immediately freezes ALL queue entries and
 -- shows a one-shot toast prompting the user to re-enter the token (HIGH-I fix).
