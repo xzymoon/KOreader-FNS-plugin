@@ -43,6 +43,8 @@ local Config = require("config")
 local Api = require("api")
 local Excerpt = require("excerpt")
 local Marker = require("marker")
+local Threeway = require("threeway")
+local Event = require("ui/event")
 
 local FnsSync = WidgetContainer:extend{
     name = "fns_sync",
@@ -464,7 +466,10 @@ function FnsSync:_triggerSync(opts)
     end
     local annotations = self.ui and self.ui.annotation
         and self.ui.annotation.annotations or {}
-    if #annotations == 0 then
+    -- Bidirectional path (M7): allow empty annotations — first-time pull
+    -- after enabling the toggle legitimately has zero local highlights
+    -- (entire round is server → local). Only short-circuit when push-only.
+    if #annotations == 0 and not self.settings.bidirectional_sync_enabled then
         if not silent then
             UIManager:show(InfoMessage:new{ text = _("当前书没有高亮/笔记") })
         end
@@ -512,10 +517,9 @@ end
 
 --- Dispatcher (M7): route to Legacy (M5/M6 behavior) or Bidirectional
 --- (M7 three-way merge with pull). bidirectional_sync_enabled defaults to
---- false; until Day 2b wires it into Config.DEFAULTS, the read returns nil
---- (falsy) → routes to Legacy. _doSyncCurrentBookBidirectional itself is
---- stubbed until Commit 2 of Day 2a; until then the function reference
---- exists but the body is unreachable because the gate is false.
+--- nil/false until Day 2b wires it into Config.DEFAULTS — until then the
+--- dispatcher always routes to Legacy, so enabling the toggle in settings
+--- by hand has no effect until Day 2b ships.
 --- Queue path (M6 _processQueueItem) calls _doSyncCurrentBookLegacy DIRECTLY
 --- (per user decision #4: 离线书不做拉取 — see progress 2026-08-06).
 function FnsSync:_doSyncCurrentBook(annotations, meta, path, silent)
@@ -639,6 +643,359 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
     end
     -- Defensive fallback (should be unreachable).
     return { ok = false, reason = "unknown" }
+end
+
+--- Bidirectional sync (M7): three-way merge with pull.
+-- One sync round = atomic unit (per design v4 H-A2, see progress 2026-08-06):
+--   1. GET server note → parse → server_segments (each hl seg carries seg.meta)
+--   2. local annotations → local_ts_set + current_meta_map (pos0/pos1/chapter)
+--   3. load last_synced[book_path]
+--   4. Threeway.computeActions → {insert_on_server, delete_on_server,
+--      insert_on_local, delete_on_local}
+--   5. apply server-side actions via Marker.applyDiff → new_server_content
+--   6. apply local-side actions:
+--      - insert_on_local: extract text via getTextFromXPointers, validate
+--        against seg.content (substring), addItem (suppressed dispatch via
+--        _pull_in_flight)
+--      - delete_on_local: direct table.remove (no dispatch)
+--   7. overwriteNote(new_server_content)
+--   8. on success: update last_synced = new_server_ts ∪ successfully_added_local_ts
+--   9. dispatch AnnotationsModified ONCE with cause="remote_pull"
+--  10. toast with stats
+--
+-- Version-mismatch policy (user decision 2026-08-07, see memory
+-- project-m7-version-mismatch): when extracted text doesn't substring-match
+-- server seg.content, skip addItem + warn log + don't count ts into
+-- last_synced (auto-retry next round). Highlight colored on wrong text is
+-- more confusing than missing one. M8 will add text-search fallback.
+--
+-- Format gate (progress 2026-08-06): only crengine formats (EPUB/MOBI/AZW3/
+-- FB2/TXT/HTML) support pull. PDF/CBZ/DJVU skip the pull phase silently
+-- (self.ui.rolling == false) but still push local-new to server.
+function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent)
+    annotations = annotations or {}
+
+    -- can_pull gates the entire local-insert phase. paging mode (PDF etc.)
+    -- has no XPointer, getTextFromXPointers doesn't apply — skip pull only.
+    local can_pull = self.ui and self.ui.rolling == true
+    if not can_pull then
+        logger.info("[FNS] bidirectional sync: paging mode (PDF?), pull phase will be skipped")
+    end
+
+    -- Step 1: render local highlights (push direction + meta source)
+    local highlights_by_ts = Excerpt:renderExcerptBlock(annotations, self.settings)
+
+    -- Step 2: build local_ts_set + current_meta_map from annotations
+    local local_ts_set = {}
+    local current_meta_map = {}
+    for _, ann in ipairs(annotations) do
+        if ann.datetime then
+            local_ts_set[ann.datetime] = true
+            if can_pull and ann.pos0 and ann.pos1 then
+                current_meta_map[ann.datetime] = {
+                    pos0 = ann.pos0,
+                    pos1 = ann.pos1,
+                    chapter = ann.chapter,
+                }
+            end
+        end
+    end
+
+    -- Step 3: GET server note
+    local get_result = Api:getNote(self.settings, path)
+    if not get_result.ok then
+        if not silent then self:_showSyncError(get_result) end
+        return { ok = false, reason = "get_failed", result = get_result }
+    end
+
+    -- Step 4: first-time sync (note doesn't exist) → create + initialize last_synced
+    if not get_result.exists then
+        logger.info("[FNS] bidirectional first-sync: creating note with META fields")
+        local new_content = Excerpt:renderFullNote(highlights_by_ts, self.settings, meta, current_meta_map)
+        local create_result = Api:createNote(self.settings, path, new_content)
+        if not create_result.ok then
+            if not silent then self:_showSyncError(create_result) end
+            return { ok = false, reason = "create_failed", result = create_result }
+        end
+        if create_result.created then
+            -- All local highlights just got pushed → last_synced = local_ts_set.
+            self:_saveLastSyncedSet(path, local_ts_set)
+            logger.info(string.format("[FNS] bidirectional first-sync success: %d highlights at %s",
+                #annotations, path))
+            if not silent then
+                UIManager:show(InfoMessage:new{
+                    text = string.format(_("首次双向同步完成（已创建笔记并推送 %d 条）：\n%s"),
+                        #annotations, path),
+                    timeout = 3,
+                })
+            end
+            return { ok = true, created = true, n_pushed = #annotations }
+        end
+        if create_result.already_exists then
+            logger.info("[FNS] bidirectional first-sync race: another client created note")
+            if not silent then
+                UIManager:show(InfoMessage:new{
+                    text = _("笔记刚被其他客户端创建，请重试同步"),
+                    timeout = 3,
+                })
+            end
+            return { ok = false, reason = "race", result = create_result }
+        end
+        return { ok = false, reason = "create_unknown", result = create_result }
+    end
+
+    -- Step 5: parse server content → server_segments + lookup maps
+    local server_segments = Marker.parse(get_result.content)
+    local server_ts_set = {}
+    local server_seg_by_ts = {}
+    for _, seg in ipairs(server_segments) do
+        if seg.type == "hl" then
+            server_ts_set[seg.ts] = true
+            server_seg_by_ts[seg.ts] = seg
+        end
+    end
+
+    -- Step 6: anomaly defense (progress v4 I 项).
+    -- server_ts_set empty + last_ts_set non-empty could mean:
+    --   (a) user genuinely cleared all HL@ in Obsidian → intended (decision #2,
+    --       Obsidian delete = cross-device delete local) → proceed
+    --   (b) parse failed / HL@ format corrupted → refuse (would wipe local)
+    -- Distinguish: does server_segments have any non-empty user text?
+    local last_ts_set = self:_getLastSyncedSet(path)
+    if not next(server_ts_set) and next(last_ts_set) then
+        local has_user_content = false
+        for _, seg in ipairs(server_segments) do
+            if seg.type == "user" and seg.content and seg.content:match("%S") then
+                has_user_content = true
+                break
+            end
+        end
+        if not has_user_content then
+            logger.warn("[FNS] server note empty (user cleared all HL@) — proceeding with delete-all-local semantics")
+        else
+            logger.warn("[FNS] server note has content but no HL@ blocks parsed — refusing to sync")
+            if not silent then
+                UIManager:show(InfoMessage:new{
+                    text = _("服务器笔记格式异常（无法解析 HL@ 块），跳过同步以免误删本地高亮"),
+                    timeout = 5,
+                })
+            end
+            return { ok = false, reason = "parse_failed" }
+        end
+    end
+
+    -- Step 7: three-way merge
+    local actions = Threeway.computeActions(server_ts_set, local_ts_set, last_ts_set)
+    logger.info(string.format("[FNS] threeway actions: +server=%d -server=%d +local=%d -local=%d",
+        #actions.insert_on_server, #actions.delete_on_server,
+        #actions.insert_on_local, #actions.delete_on_local))
+
+    -- Step 8: apply server-side actions → new_server_content.
+    -- Convert Threeway actions to Marker actions (op/ts/content/meta format),
+    -- reuse Marker.applyDiff for ordering + seg construction.
+    local marker_actions = {}
+    for _, ts in ipairs(actions.insert_on_server) do
+        table.insert(marker_actions, {
+            op = "insert", ts = ts,
+            content = highlights_by_ts[ts],
+            meta = current_meta_map[ts],
+        })
+    end
+    for _, ts in ipairs(actions.delete_on_server) do
+        table.insert(marker_actions, { op = "delete", ts = ts })
+    end
+    local new_server_segments = Marker.applyDiff(server_segments, marker_actions)
+    local new_server_content = Marker.serialize(new_server_segments)
+
+    -- Step 9: apply local-side actions (the "pull" direction).
+    local n_inserted_local = 0
+    local n_deleted_local = 0
+    local n_skip_no_meta = 0
+    local n_skip_text_empty = 0
+    local n_skip_text_mismatch = 0
+    local n_skip_failed = 0
+    local successfully_added_local_ts = {}
+
+    self._pull_in_flight = true
+    if can_pull then
+        for _, ts in ipairs(actions.insert_on_local) do
+            local seg = server_seg_by_ts[ts]
+            if not seg or not seg.meta or not seg.meta.pos0 or not seg.meta.pos1 then
+                n_skip_no_meta = n_skip_no_meta + 1
+                logger.warn("[FNS] pull insert skipped (server seg has no meta, old note?): ts=" .. tostring(ts))
+            else
+                -- Truncate XPointer in logs (progress v4 L-C2 DEBUG hygiene).
+                local pos0_str = tostring(seg.meta.pos0)
+                local pos1_str = tostring(seg.meta.pos1)
+                local extracted = self.ui.document:getTextFromXPointers(seg.meta.pos0, seg.meta.pos1)
+                if extracted == nil or extracted == "" then
+                    n_skip_text_empty = n_skip_text_empty + 1
+                    logger.warn(string.format(
+                        "[FNS] pull insert skipped (text extraction empty, XPointer invalid?): ts=%s pos0=%s(%d) pos1=%s(%d)",
+                        tostring(ts), pos0_str:sub(1, 40), #pos0_str, pos1_str:sub(1, 40), #pos1_str))
+                elseif not string.find(seg.content, extracted, 1, true) then
+                    -- Substring check fails: extracted text not in server's markdown
+                    -- content → book version differs between devices (XPointer landed
+                    -- on different text). Skip + warn; don't count into last_synced
+                    -- so next round retries. (M8 will add text-search fallback.)
+                    n_skip_text_mismatch = n_skip_text_mismatch + 1
+                    logger.warn(string.format(
+                        "[FNS] pull insert skipped (text mismatch, version diff?): ts=%s extracted_head=%q server_content_head=%q",
+                        tostring(ts),
+                        tostring(extracted):sub(1, 40),
+                        tostring(seg.content):sub(1, 40)))
+                else
+                    local item = {
+                        page = seg.meta.pos0,    -- rolling mode: XPointer start
+                        pos0 = seg.meta.pos0,
+                        pos1 = seg.meta.pos1,
+                        text = extracted,
+                        chapter = seg.meta.chapter,
+                        drawer = "lighten",      -- default highlight style; M8 may sync this
+                        datetime = ts,
+                    }
+                    local ok, idx_or_err = pcall(function()
+                        return self.ui.annotation:addItem(item)
+                    end)
+                    if ok and idx_or_err then
+                        n_inserted_local = n_inserted_local + 1
+                        successfully_added_local_ts[ts] = true
+                    else
+                        n_skip_failed = n_skip_failed + 1
+                        logger.warn("[FNS] pull insert addItem failed: ts=" .. tostring(ts)
+                            .. " err=" .. tostring(idx_or_err))
+                    end
+                end
+            end
+        end
+    else
+        if #actions.insert_on_local > 0 then
+            logger.info(string.format("[FNS] pull phase skipped (paging mode): %d server-new highlights not pulled",
+                #actions.insert_on_local))
+        end
+    end
+
+    -- delete_on_local: direct table.remove (NOT removeItemByIndex, which would
+    -- dispatch AnnotationsModified without cause=remote_pull → M5 self-loop).
+    if #actions.delete_on_local > 0 then
+        local delete_ts_set = {}
+        for _, ts in ipairs(actions.delete_on_local) do
+            delete_ts_set[ts] = true
+        end
+        local indices_to_remove = {}
+        for i, ann in ipairs(self.ui.annotation.annotations) do
+            if ann.datetime and delete_ts_set[ann.datetime] then
+                table.insert(indices_to_remove, i)
+            end
+        end
+        -- Sort descending so removal doesn't shift not-yet-processed indices.
+        table.sort(indices_to_remove, function(a, b) return a > b end)
+        for _, idx in ipairs(indices_to_remove) do
+            table.remove(self.ui.annotation.annotations, idx)
+            n_deleted_local = n_deleted_local + 1
+        end
+    end
+    self._pull_in_flight = false
+
+    -- Step 10: overwriteNote
+    local original_ctime = get_result.note and get_result.note.ctime
+    local post_result = Api:overwriteNote(self.settings, path, new_server_content, original_ctime)
+    if not post_result.ok then
+        if not silent then self:_showSyncError(post_result) end
+        return { ok = false, reason = "overwrite_failed", result = post_result }
+    end
+
+    -- Step 11: update last_synced = new_server_ts ∪ successfully_added_local_ts.
+    -- new_server_ts = (server_ts ∪ insert_on_server) - delete_on_server.
+    --
+    -- CRITICAL: skipped local inserts are NOT counted. If we counted them,
+    -- next round's three-way merge would see "server has X, local missing,
+    -- last has X" → classify as delete_on_local (user removed) and never
+    -- retry insert_on_local. By excluding them, next round re-evaluates
+    -- them as "server has X, local missing, last missing" → insert_on_local
+    -- (retry). This implements the user-decision policy "跳过+警告，下次重试"
+    -- (see memory project-m7-version-mismatch).
+    local skipped_local_ts = {}
+    for _, ts in ipairs(actions.insert_on_local) do
+        if not successfully_added_local_ts[ts] then
+            skipped_local_ts[ts] = true
+        end
+    end
+    local new_last = {}
+    for ts in pairs(server_ts_set) do
+        if not skipped_local_ts[ts] then
+            new_last[ts] = true
+        end
+    end
+    for _, ts in ipairs(actions.insert_on_server) do new_last[ts] = true end
+    for _, ts in ipairs(actions.delete_on_server) do new_last[ts] = nil end
+    for ts in pairs(successfully_added_local_ts) do new_last[ts] = true end
+    self:_saveLastSyncedSet(path, new_last)
+
+    -- Step 12: dispatch AnnotationsModified ONCE with cause="remote_pull".
+    -- Other listeners (footer / bookmark view) get the update; M5 debounce
+    -- explicitly skips this cause (see onAnnotationsModified).
+    if n_inserted_local > 0 or n_deleted_local > 0 then
+        self.ui:handleEvent(Event:new("AnnotationsModified", {
+            nb_highlights_added = n_inserted_local - n_deleted_local,
+            cause = "remote_pull",
+        }))
+    end
+
+    -- Step 13: log + toast
+    local n_skip_total = n_skip_no_meta + n_skip_text_empty + n_skip_text_mismatch + n_skip_failed
+    logger.info(string.format(
+        "[FNS] bidirectional sync success at %s: +local=%d -local=%d +server=%d -server=%d skip=%d(no_meta=%d empty=%d mismatch=%d failed=%d)",
+        path, n_inserted_local, n_deleted_local,
+        #actions.insert_on_server, #actions.delete_on_server,
+        n_skip_total, n_skip_no_meta, n_skip_text_empty, n_skip_text_mismatch, n_skip_failed))
+    if not silent then
+        local msg = string.format(_("双向同步完成：\n+本地 %d  -本地 %d\n+远端 %d  -远端 %d"),
+            n_inserted_local, n_deleted_local,
+            #actions.insert_on_server, #actions.delete_on_server)
+        if n_skip_total > 0 then
+            msg = msg .. string.format(_("\n\n跳过 %d 条（详见 crash.log）"), n_skip_total)
+        end
+        UIManager:show(InfoMessage:new{ text = msg, timeout = 5 })
+    end
+
+    return {
+        ok = true,
+        n_inserted_local = n_inserted_local,
+        n_deleted_local = n_deleted_local,
+        n_inserted_server = #actions.insert_on_server,
+        n_deleted_server = #actions.delete_on_server,
+        n_skipped = n_skip_total,
+    }
+end
+
+--- "Pull remote highlights" button entry (M7). Per design v4 H-A2, pull and
+--- push are inseparable (one sync round), so this is a thin wrapper around
+--- _triggerSync with the bidirectional gate already on. The button label
+--- emphasizes "pull" because that's the user-visible new capability, but it
+--- always also pushes local-new highlights to server.
+function FnsSync:_pullRemoteHighlights()
+    logger.info("[FNS] event: _pullRemoteHighlights (manual button or scheduled pull)")
+    if not self.settings.bidirectional_sync_enabled then
+        -- Defensive: button is hidden when toggle is off (Day 2b menu), but
+        -- pull_on_book_open scheduled task could fire if user toggled off
+        -- between schedule and fire. Silent-skip.
+        logger.info("[FNS] pull skipped: bidirectional_sync_enabled=false")
+        return
+    end
+    if not self:isConfigured() then
+        UIManager:show(InfoMessage:new{ text = _("请先配置服务 URL / Token / Vault") })
+        return
+    end
+    if self._sync_in_flight then
+        logger.info("[FNS] pull skipped: another sync in flight")
+        return
+    end
+    -- _triggerSync will route to _doSyncCurrentBookBidirectional via dispatcher
+    -- (bidirectional_sync_enabled is true here). Force-clear in-flight lock
+    -- like onSyncCurrentBook does — manual intent overrides concurrent guard.
+    self._sync_in_flight = false
+    self:_triggerSync{ silent = false }
 end
 
 -- ===========================================================================

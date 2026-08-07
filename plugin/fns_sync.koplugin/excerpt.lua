@@ -170,8 +170,12 @@ end
 -- @param highlights_by_ts table  result of renderExcerptBlock
 -- @param settings table
 -- @param meta table  { title, author, language, ... }
+-- @param current_meta_map table|nil  (M7) optional { ts -> { pos0, pos1, chapter } }
+--        from local annotations. When present, each HL@ block's open marker
+--        carries pos0/pos1/chapter for cross-device re-creation. Legacy path
+--        omits this (nil) → blocks have no META fields (back-compat).
 -- @return string  complete note content ready to POST
-function Markdown:renderFullNote(highlights_by_ts, settings, meta)
+function Markdown:renderFullNote(highlights_by_ts, settings, meta, current_meta_map)
     local template = settings.note_template or Config.DEFAULT_NOTE_TEMPLATE
 
     local function fill(text, key, value)
@@ -199,7 +203,10 @@ function Markdown:renderFullNote(highlights_by_ts, settings, meta)
 
     local blocks = {}
     for _, ts in ipairs(sorted_ts) do
-        table.insert(blocks, Marker.wrapBlock(ts, highlights_by_ts[ts]))
+        -- M7: pass current_meta_map[ts] (may be nil) so first-time notes
+        -- created on a bidirectional-enabled device ship with META fields.
+        local block_meta = current_meta_map and current_meta_map[ts]
+        table.insert(blocks, Marker.wrapBlock(ts, highlights_by_ts[ts], block_meta))
     end
     local highlights_str = table.concat(blocks, "\n\n\n")  -- two blank lines between blocks (matches serialize)
 

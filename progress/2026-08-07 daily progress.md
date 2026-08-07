@@ -175,3 +175,120 @@ feat(M7): Day 2a/Commit 1 — main.lua dispatcher 拆分 + 锁扩展 + 持久化
 
 Commit 2 实现 _doSyncCurrentBookBidirectional + _pullRemoteHighlights。
 ```
+
+---
+
+## Day 2a Commit 2：_doSyncCurrentBookBidirectional + _pullRemoteHighlights
+
+### 改动文件
+
+- `plugin/fns_sync.koplugin/main.lua`（+367 -7）
+- `plugin/fns_sync.koplugin/excerpt.lua`（+11 -2，renderFullNote 加可选 current_meta_map 参数）
+
+### 实施前发现的设计漏洞
+
+**漏洞 1：跨设备 text 字段同步**
+
+设计阶段没考虑过：B 设备拉 A 设备同步过来的高亮时，text 字段从哪来？server 上 HL@ 块的 content 是渲染后的 markdown（带 `> 📖 第 N 页`），没法反推原始 text。
+
+**用户决策（2026-08-07）**：用 KOreader 的 `document:getTextFromXPointers(pos0, pos1)` API 实时从本地书的 XPointer 范围提取 text。同时加**文字一致性校验**：用子串匹配（extracted 是否是 server seg.content 的子串）检测跨设备书版本不一致。不一致时**跳过 + 警告**（A 方案），M8 升级文字搜索兜底。已存入 memory `project_m7_version_mismatch.md`。
+
+**漏洞 2：_triggerSync 在 annotations 为空时早返回**
+
+启用 Bidirectional 后首次按"立即拉取"按钮时本地通常没高亮，但 _triggerSync 的早返回会阻断 pull 路径。修复：只在非 Bidirectional 模式下早返回。
+
+**漏洞 3：跳过的 ts 会被错误计入 last_synced**
+
+实施时 self-review 发现：如果跳过的 ts 仍计入 last_synced，下次三路合并会判定"server 有 local 没 last 有" → delete_on_local（noop）→ 永不重试。修复：在 Step 11 推导 `skipped_local_ts = actions.insert_on_local - successfully_added_local_ts`，从 new_last 中显式排除。
+
+### 改动详情
+
+**1. 顶部 require 新增**
+- `local Threeway = require("threeway")`：昨日写的三路合并纯函数模块
+- `local Event = require("ui/event")`：用于 dispatch AnnotationsModified with cause
+
+**2. excerpt.lua:renderFullNote 加可选第 4 参数 current_meta_map**
+
+签名：`renderFullNote(highlights_by_ts, settings, meta, current_meta_map)`
+
+- 当 current_meta_map 非空时，每个 HL@ 块的起标记带 pos0/pos1/chapter
+- 当 nil 时（Legacy 路径），行为不变（向后兼容）
+- 用途：Bidirectional 首次同步创建笔记时也要带 META 字段，否则其他设备拉下来 seg.meta=nil 无法 addItem
+
+**3. _triggerSync 修复 annotations 早返回**
+
+`if #annotations == 0 and not self.settings.bidirectional_sync_enabled then` —— Bidirectional 路径允许空 annotations（首次启用 pull 场景）。
+
+**4. _doSyncCurrentBookBidirectional（核心新增，~280 行 + 60 行 doc comment）**
+
+13 步同步回合：
+1. annotations 防御性 nil → {}
+2. can_pull gate 在 self.ui.rolling（PDF 等 paging 模式跳过 pull phase）
+3. 渲染本地 highlights_by_ts
+4. 构造 local_ts_set + current_meta_map from annotations
+5. GET server note
+6. 首次同步（note 不存在）→ createNote + 初始化 last_synced = local_ts_set
+7. parse server → server_segments + server_ts_set + server_seg_by_ts
+8. 异常防护：server_ts_set 空 + last_ts_set 非空 → 区分"用户清空"vs"格式损坏"（后者拒绝执行）
+9. 三路合并 computeActions
+10. 应用 server actions（转 Marker 格式 + Marker.applyDiff + serialize → new_server_content）
+11. 应用 local actions：
+    - insert_on_local：getTextFromXPointers → 子串校验 → 通过 addItem / 失败 skip + warn
+    - delete_on_local：直接 table.remove（倒序，避免 dispatch）
+    - _pull_in_flight 包裹整个过程
+12. overwriteNote(new_server_content)
+13. 更新 last_synced = (server_ts ∪ insert_on_server - delete_on_server) - skipped_local_ts
+14. dispatch AnnotationsModified ONCE with cause="remote_pull"（仅当有变更）
+15. toast + 详细日志
+
+**5. _pullRemoteHighlights（30 行）**
+
+"立即拉取远端高亮"按钮入口。是 _triggerSync{ silent=false } 的薄包装（dispatcher 自动路由到 Bidirectional）。Per 设计 v4 H-A2，推拉不可分割。
+
+### 跳过 case 统计维度（4 类）
+
+| 类型 | 触发条件 | 处理 |
+|------|---------|------|
+| `n_skip_no_meta` | server seg 缺 meta（老笔记无 pos0/pos1） | 跳过 + warn |
+| `n_skip_text_empty` | getTextFromXPointers 返回空（XPointer 完全失效） | 跳过 + warn + XPointer 头 40 字 + 长度 |
+| `n_skip_text_mismatch` | 子串校验失败（书版本不一致） | 跳过 + warn + extracted 头 40 字 + content 头 40 字 |
+| `n_skip_failed` | addItem pcall 失败 | 跳过 + warn + err |
+
+所有跳过的 ts 都不计入 last_synced（推导自 `insert_on_local - successfully_added`），下次同步自动重试。
+
+### 行为不变性验证
+
+| 路径 | Commit 1 之后 | Commit 2 之后 |
+|------|--------------|--------------|
+| M5 实时同步 | 走 Legacy | bidirectional_sync_enabled 为 nil → 仍走 Legacy |
+| M5 关书同步 | 走 Legacy | 同上 |
+| 手动按钮 | 走 Legacy | 同上 |
+| M6 队列 | 直接调 Legacy | 同上（强制 Legacy 不变） |
+| 首次启用 Bidirectional + 手动按"立即拉取" | (Commit 2 之前按钮不存在) | _pullRemoteHighlights → _triggerSync → dispatcher → Bidirectional |
+
+### 已知限制（M8 升级方向）
+
+- 跳过的 ts 永远不会自动恢复（直到书版本一致），需要 M8 文字搜索兜底
+- drawer 硬编码 "lighten"（KOreader 默认值），不跟用户设置走
+- 子串校验依赖 server content 含原始 text，用户改 excerpt_template 后可能失效（边界 case）
+- `_sync_in_flight` 锁在 _pullRemoteHighlights 入口被强制清掉，理论上有并发风险（manual override，与 onSyncCurrentBook 一致）
+
+### Commit 信息
+
+```
+feat(M7): Day 2a/Commit 2 — _doSyncCurrentBookBidirectional + _pullRemoteHighlights
+
+完整的 13 步同步回合（拉 → 三路合并 → 应用双方 → 推 → 更新 last）。
+跨设备 text 字段用 getTextFromXPointers 从本地书实时提取 + 子串校验。
+书版本不一致时跳过+警告（用户拍板 A 方案），M8 升级文字搜索兜底。
+
+新代码：~370 行（main.lua）+ 11 行（excerpt.lua renderFullNote 加可选 meta_map）
+
+修复 3 个实施时发现的 bug：
+- _triggerSync annotations 早返回阻断 pull（Bidirectional 首次启用场景）
+- 跳过的 ts 错误计入 last_synced 导致下次不重试（推导 skipped_local_ts 排除）
+- dispatcher 注释更新（Commit 1 说"stubbed until Commit 2"，现已实现）
+
+明日 Commit 3：onOpenDocument 加 scheduleIn(2s) → _pull_action（gated by pull_on_book_open）。
+Day 2b：config bump v4 + 菜单加"双向同步"子树 + "立即拉取"按钮 + 首次启用弹窗。
+```
