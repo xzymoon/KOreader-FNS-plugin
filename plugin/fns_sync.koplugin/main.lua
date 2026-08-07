@@ -855,6 +855,30 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
     logger.info(string.format("[FNS] threeway actions: +server=%d -server=%d +local=%d -local=%d",
         #actions.insert_on_server, #actions.delete_on_server,
         #actions.insert_on_local, #actions.delete_on_local))
+    -- M7 DEBUG: detailed ts lists for diagnosing "why didn't X sync".
+    -- Enable verbose logging in KOreader settings to see these. ts lists
+    -- are sorted for stable diff; no XPointer or text content logged (privacy).
+    if logger.dbg then
+        local function sorted_keys(set)
+            local arr = {}
+            for k in pairs(set or {}) do table.insert(arr, k) end
+            table.sort(arr)
+            return "[" .. table.concat(arr, "|") .. "]"
+        end
+        local function sorted_list(arr)
+            local copy = {}
+            for _, v in ipairs(arr or {}) do table.insert(copy, v) end
+            table.sort(copy)
+            return "[" .. table.concat(copy, "|") .. "]"
+        end
+        logger.dbg("[FNS] threeway server_ts=" .. sorted_keys(server_ts_set))
+        logger.dbg("[FNS] threeway local_ts=" .. sorted_keys(local_ts_set))
+        logger.dbg("[FNS] threeway last_ts=" .. sorted_keys(last_ts_set))
+        logger.dbg("[FNS] threeway insert_on_server=" .. sorted_list(actions.insert_on_server))
+        logger.dbg("[FNS] threeway delete_on_server=" .. sorted_list(actions.delete_on_server))
+        logger.dbg("[FNS] threeway insert_on_local=" .. sorted_list(actions.insert_on_local))
+        logger.dbg("[FNS] threeway delete_on_local=" .. sorted_list(actions.delete_on_local))
+    end
 
     -- Step 8: apply server-side actions → new_server_content.
     -- Convert Threeway actions to Marker actions (op/ts/content/meta format),
