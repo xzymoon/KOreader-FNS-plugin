@@ -1506,9 +1506,19 @@ end
 --- Document open event (M6 review H-1). Design lists onOpenDocument as one
 -- of the 3 fallback paths to drain the queue, but initial implementation
 -- missed it. Cheap to add — just calls _processQueue.
+-- M7: also schedules a delayed bidirectional pull when both
+-- bidirectional_sync_enabled AND pull_on_book_open are on. The 2s delay
+-- lets ReaderUI finish coming up (esp. crengine document load) before we
+-- fire HTTP + addItem batch. _pull_action is a stable closure assigned
+-- once in init, so onCloseWidget can unschedule cleanly if user closes
+-- the book before the 2s timer fires.
 function FnsSync:onOpenDocument()
     logger.info("[FNS] event: onOpenDocument")
     self:_processQueue()
+    if self.settings.bidirectional_sync_enabled and self.settings.pull_on_book_open then
+        logger.info("[FNS] onOpenDocument: scheduleIn(2s) → _pull_action (bidirectional pull)")
+        UIManager:scheduleIn(2, self._pull_action)
+    end
 end
 
 --- Widget teardown (M6 review H-3). Cancel any pending queue drain
