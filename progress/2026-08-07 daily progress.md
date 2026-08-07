@@ -477,3 +477,74 @@ feat(M7): Day 2b/Commit 2 — 菜单加"双向同步"子树 + "立即拉取"按�
 
 Day 2b 全部完成。下一步 Day 3：DEBUG 日志加足 + 自审 + 多 agent 审查。
 ```
+
+---
+
+## Day 3 多 agent 审查 + bug 修复
+
+### Phase 3：4 agent 并行审查结果
+
+| Agent | HIGH | MEDIUM | LOW |
+|-------|:---:|:---:|:---:|
+| silent-failure-hunter | 3 | 5 | 5 |
+| security-reviewer | 2 | 4 | 2 |
+| code-reviewer | 2（含撤回 1）| 4 | 4 |
+| architect | 3 | 4 | 2 |
+
+### Phase 4 修复（按严重度分级）
+
+#### HIGH 全部修复 ✅
+
+1. **_pull_in_flight 异常路径不释放**（silent H1 + code H1）：在 _triggerSync 的 pcall finally 中复位两把锁 + toast 提示内部错误
+2. **onCloseWidget 防御性复位 _pull_in_flight**（code M4 + architect H3 复合）
+3. **XPointer 格式校验 + 长度上限**（security H1）：白名单 `^/[%w_%-%./%[%]()]+$` + MAX_XPOINTER_LEN=256
+4. **server note 大小上限**（security H2）：MAX_NOTE_BYTES=1MB 防 DoS
+5. **_pullRemoteHighlights 加 manual 参数**（architect H3）：自动 scheduleIn 不再强制清锁，避免抢占 M5 debounce
+6. **chapter 长度+换行校验**（security M2）：MAX_CHAPTER_LEN=256
+7. **同步回合原子性重构**（architect H1+H2）：Step 9 拆为"extract+validate"和"apply local"，中间插入 overwriteNote
+
+#### MEDIUM 部分修复 ✅
+
+- extracted_head 改成 extracted_len（privacy：不打用户文字到 crash.log）
+- original_ctime 加 or 0 兜底
+- DEBUG 加 impossible_ts 列表：last 残留 ts 可诊断
+
+#### 未修（记入 M8 backlog）
+
+| 问题 | 来源 | 决策 |
+|------|------|------|
+| 函数拆分（320 行→ 3 helper） | code H2 | 改动大，目前可工作，M8 重构 |
+| 不同步 content update | code M2 | 设计层面决策 |
+| last_synced 独立文件持久化 | architect M1 | 简化 trade-off 已记录 |
+| chapter markdown 注入深度防御 | security M2 | 已加长度+换行校验作为第一道防线 |
+| v3→v4 migration toast 告知 | security M4 | 罕见场景 |
+| _loadBookFromPath 失败降级 | silent M2 | M6 路径 |
+| 缺 marker/excerpt 单元测试 | code L2 | M8 补 |
+
+### 同步回合原子性重构详情（architect H1+H2）
+
+**原流程**：
+```
+Step 9: apply local (addItem + table.remove)
+Step 10: overwriteNote
+```
+**问题**：Step 9 改本地，Step 10 失败时本地有"幽灵高亮"，重试混乱。
+
+**新流程**：
+```
+Step 9: extract + validate → items_to_add + indices_to_remove
+Step 10: overwriteNote (失败时本地未改 → 重试幂等)
+Step 11: apply local (addItem + table.remove)
+```
+
+好处：overwriteNote 失败时本地未改 → 重试幂等；_pull_in_flight 临界区更窄。
+
+### Phase 5：Kindle 实测清单（独立文档）
+
+详见 `progress/M7-Kindle-实测清单.md`。
+
+包含：
+- 部署 + M5/M6 回归测试
+- M7 阶段 1-7 实测场景（启用 → 首次同步 → 双向新增 → 删除 → Obsidian 删 → 版本不一致 → PDF）
+- crash.log 关键 grep
+- 验收标准 + 失败排查表
