@@ -134,6 +134,19 @@ function FnsSync:init()
     -- references after ReaderUI teardown → operate on half-destroyed state.
     self._queue_drain_action = function() self:_processQueue() end
 
+    -- M7: bidirectional sync runtime state.
+    -- _pull_in_flight suppresses onAnnotationsModified during remote-pull
+    -- batches (server-fetched highlights get addItem'd → AnnotationsModified
+    -- fires → would retrigger M5 debounce → push → self-loop). Set true
+    -- before addItem loop, false after the single cause="remote_pull"
+    -- dispatch that follows it.
+    -- _pull_action is a stable closure (UIManager:unschedule matches by
+    -- reference, same pattern as _auto_sync_action / _queue_drain_action).
+    -- Used by onOpenDocument's scheduleIn(2s) delayed pull trigger; must be
+    -- assigned ONCE in init so onCloseWidget can unschedule it cleanly.
+    self._pull_in_flight = false
+    self._pull_action = function() self:_pullRemoteHighlights() end
+
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end
@@ -168,6 +181,31 @@ end
 -- there), so worst case is "no auto-retry", not "data loss".
 function FnsSync:_saveQueue()
     G_reader_settings:saveSetting("fns_sync_queue", self.queue)
+end
+
+-- M7: per-book last_synced ts-set persistence. Used by three-way merge as
+-- the "base" reference — ts present here means "we've already seen this
+-- highlight synchronized in a prior round, so its absence on local+server
+-- now means delete, not first-insert".
+--
+-- Storage simplification vs progress v4 design: stored inside
+-- G_reader_settings (key "fns_sync_last_synced") instead of a dedicated
+-- fns_sync_state.lua file with atomic temp+fsync+rename. Trade-off:
+-- KOreader's LuaSettings flush is good-enough for this size (per-book ts
+-- set rarely exceeds ~100 entries); we lose hard-crash atomicity but gain
+-- implementation simplicity. Revisit with independent file if measurement
+-- shows corruption in the field.
+--
+-- Structure: { [book_path] = { [ts_string] = true, ... }, ... }
+function FnsSync:_getLastSyncedSet(book_path)
+    local all = G_reader_settings:readSetting("fns_sync_last_synced", {}) or {}
+    return all[book_path] or {}
+end
+
+function FnsSync:_saveLastSyncedSet(book_path, ts_set)
+    local all = G_reader_settings:readSetting("fns_sync_last_synced", {}) or {}
+    all[book_path] = ts_set
+    G_reader_settings:saveSetting("fns_sync_last_synced", all)
 end
 
 -- ===========================================================================
@@ -472,7 +510,22 @@ function FnsSync:onSyncCurrentBook()
     self:_triggerSync{ silent = false }
 end
 
+--- Dispatcher (M7): route to Legacy (M5/M6 behavior) or Bidirectional
+--- (M7 three-way merge with pull). bidirectional_sync_enabled defaults to
+--- false; until Day 2b wires it into Config.DEFAULTS, the read returns nil
+--- (falsy) → routes to Legacy. _doSyncCurrentBookBidirectional itself is
+--- stubbed until Commit 2 of Day 2a; until then the function reference
+--- exists but the body is unreachable because the gate is false.
+--- Queue path (M6 _processQueueItem) calls _doSyncCurrentBookLegacy DIRECTLY
+--- (per user decision #4: 离线书不做拉取 — see progress 2026-08-06).
 function FnsSync:_doSyncCurrentBook(annotations, meta, path, silent)
+    if self.settings.bidirectional_sync_enabled then
+        return self:_doSyncCurrentBookBidirectional(annotations, meta, path, silent)
+    end
+    return self:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
+end
+
+function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
     -- Render current KOreader highlights into a { ts -> block_content } table.
     -- This is the source-of-truth for what should be in the note after sync.
     --
@@ -656,6 +709,24 @@ end
 --- only use the event as a sync trigger signal, so we ignore it.
 function FnsSync:onAnnotationsModified(payload)
     logger.info("[FNS] event: onAnnotationsModified")
+    -- M7: suppress M5 debounce during remote pull to avoid self-loop
+    -- (per design v4 H-S2 fix, see progress 2026-08-06). Two suppression
+    -- paths cover both phases of a pull round:
+    --   1. _pull_in_flight: set true while batch addItem'ing server-fetched
+    --      highlights. Each addItem → AnnotationsModified → here. Without
+    --      this guard M5 would debounce-push mid-pull.
+    --   2. payload.cause == "remote_pull": the single dispatch we fire AFTER
+    --      the batch completes (carries nb_highlights_added summary). This
+    --      lets other listeners (readerbookmark view refresh etc.) update,
+    --      while M5 explicitly skips it.
+    if self._pull_in_flight then
+        logger.dbg("[FNS] onAnnotationsModified: skip (pull in flight)")
+        return
+    end
+    if payload and payload.cause == "remote_pull" then
+        logger.dbg("[FNS] onAnnotationsModified: skip (cause=remote_pull)")
+        return
+    end
     if not self:_gateAutoSync() then
         logger.dbg("[FNS] onAnnotationsModified: _gateAutoSync false")
         return
@@ -874,10 +945,13 @@ function FnsSync:_processQueueItem(book_path, on_complete)
         return
     end
 
-    -- _doSyncCurrentBook returns a result table (M6). pcall so any
+    -- _doSyncCurrentBookLegacy returns a result table (M6). pcall so any
     -- rendering/marker bug doesn't strand the entry and lock (HIGH-D fix).
+    -- Direct call to Legacy (not dispatcher) per user decision #4 — queue
+    -- path never does remote pull (offline books have nothing new on server
+    -- worth fetching, and pull requires the book to be open for addItem).
     local ok, result_or_err = pcall(function()
-        return self:_doSyncCurrentBook(annotations, meta, note_path, true)
+        return self:_doSyncCurrentBookLegacy(annotations, meta, note_path, true)
     end)
 
     if not ok then
@@ -1094,6 +1168,12 @@ function FnsSync:onCloseWidget()
     end
     if self._auto_sync_action then
         UIManager:unschedule(self._auto_sync_action)
+    end
+    -- M7: cancel any pending pull scheduled by onOpenDocument's scheduleIn(2s).
+    -- Without this, _pull_action fires after ReaderUI teardown and dereferences
+    -- a dead self.ui (same failure mode as M6's _queue_drain_action fix).
+    if self._pull_action then
+        UIManager:unschedule(self._pull_action)
     end
 end
 
