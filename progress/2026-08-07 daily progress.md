@@ -2,16 +2,37 @@
 
 ## 主要任务
 
-M7 Day 1b 收尾 + Day 2a 启动。
+M7 跨设备双向同步的实施 + 多 agent 审查 + 修复，从 Day 1b 收尾一路推到 Day 3 完成。M7 实施层面全部完工，剩 Kindle 实测（用户回来做）。
 
-- Day 1b：`marker.lua:applyDiff` 收尾（已 commit）
-- Day 2a Commit 1：main.lua dispatcher 拆分 + 锁扩展 + 持久化 helper + 事件抑制（无行为变化）
+**今日 10 个 commit**：
+
+| Commit | 阶段 | 内容 |
+|--------|------|------|
+| `8ab8526` | Day 1b | marker.lua applyDiff 收尾 |
+| `f1bf7e1` | Day 2a/1 | main.lua dispatcher 拆分 + 锁扩展 + 持久化 helper |
+| `61c5f2d` | Day 2a/2 | _doSyncCurrentBookBidirectional + _pullRemoteHighlights（13 步同步回合） |
+| `f5ebeef` | Day 2a/3 | onOpenDocument 加 scheduleIn(2s) pull 钩子 |
+| `486278c` | Day 2b/1 | config bump v4 + 字段重命名 + migration |
+| `37c7daa` | Day 2b/2 | 菜单加"双向同步"子树 + "立即拉取"按钮 + 首次启用弹窗 |
+| `eb339b5` | Day 3/Phase 1 | 补 DEBUG 日志（三路合并 ts 详情） |
+| `e934971` | Day 3/Phase 4 批 1 | HIGH 5 项 + MEDIUM 4 项修复 |
+| `871ca98` | Day 3/Phase 4 批 2 | 同步回合原子性重构（architect H1+H2） |
+| `bed31dd` | Day 3 docs | progress 文档补完 |
+
+**关键产品决策**（用户拍板）：
+- 跨设备 text 字段用 `getTextFromXPointers` API + 子串校验
+- 书版本不一致时**跳过 + 警告**（A 方案），M8 升级文字搜索兜底
+- 已存 memory `project_m7_version_mismatch.md`
+
+**多 agent 审查**（Day 3 Phase 3）：4 agent 并行（silent-failure-hunter + security-reviewer + code-reviewer + architect），找到 ~7 类 HIGH + ~13 类 MEDIUM + ~10 类 LOW。
+
+**M7 实施状态**：✅ 设计 + ✅ 代码 + ✅ 审查 + ✅ 修复 + ⏳ Kindle 实测（待用户）
 
 ---
 
 ## 范围说明
 
-延续 2026-08-06 的 M7 设计 v4，今日只做一件小事：把昨日遗留的 applyDiff 半成品收尾。
+延续 2026-08-06 的 M7 设计 v4，今日完成了从 Day 1b 收尾到 Day 3 全部工作。每个阶段都按"surgical changes + self-review + 多 agent 审查"工作流推进。
 
 决策：本机不装 Lua 解释器，`tests/test_threeway.lua` 留待 Kindle 实测阶段统一验证（逻辑已人工对照真值表）。
 
@@ -548,3 +569,79 @@ Step 11: apply local (addItem + table.remove)
 - M7 阶段 1-7 实测场景（启用 → 首次同步 → 双向新增 → 删除 → Obsidian 删 → 版本不一致 → PDF）
 - crash.log 关键 grep
 - 验收标准 + 失败排查表
+
+---
+
+## 今日总结
+
+### 完成情况
+
+| 维度 | 状态 |
+|------|------|
+| 代码实施 | ✅ Day 1b / Day 2a / Day 2b 全部完成 |
+| DEBUG 日志加足 | ✅ Phase 1 完成（三路合并 ts 详情 + impossible_ts） |
+| 自审 | ✅ Phase 2 完成（找到 _pull_in_flight 异常路径 bug） |
+| 多 agent 审查 | ✅ Phase 3 完成（4 agent 并行） |
+| bug 修复 | ✅ Phase 4 完成（HIGH 7 + MEDIUM 3） |
+| Kindle 实测清单 | ✅ Phase 5 完成（独立文档） |
+| Kindle 实测本身 | ⏳ 待用户回来做 |
+
+### 自主决策记录（用户授权"选最优最稳妥"）
+
+按用户授权原则，今天的自主决策已记入 progress 各节，重要的几条汇总：
+
+1. **跨设备 text 字段方案**：用 KOreader 自带的 `getTextFromXPointers` API 实时提取，不存到 server（避免 server 笔记臃肿）。同时加子串校验检测版本不一致。用户拍板 A 方案（跳过 + 警告）+ M8 文字搜索兜底。
+2. **architect H1 大重构**：选了"Step 9 推后"方案 A（architect 推荐），不选方案 B（回滚复杂、容易出 bug）。
+3. **security H1 校验白名单**：用 Lua pattern `^/[%w_%-%./%[%]()]+$`，覆盖 readerlink.lua 真实 XPointer 字符集。
+4. **HIGH 全修，MEDIUM 选性价比高的修，LOW 全部进 M8 backlog**：避免过度修复拖慢里程碑。
+5. **简化实施 vs 设计文档偏离**：last_synced 用 `G_reader_settings` 而非独立文件（architect M1），简化 trade-off 已记入 progress，等 M8 实测发现问题再升级。
+
+### M8 backlog（今天识别的，明天起可考虑）
+
+按优先级分组：
+
+**P1（功能性补强）**：
+- 文字搜索兜底（解决跨设备书版本不一致时永远跳过的问题）
+- 同步 note / color / drawer 字段（M7 只同步 text）
+- Obsidian 端编辑高亮文字后回推到 KOreader（M7 不同步 content update）
+
+**P2（架构债）**：
+- _doSyncCurrentBookBidirectional 函数拆分（320 行 → 3 helper）
+- last_synced 独立文件持久化 + 原子 temp+fsync+rename
+- 锁语义分层（M5/M6/M7 共用一把锁 → 优先级锁）
+
+**P3（测试覆盖）**：
+- tests/test_marker.lua（parseOpenMarkerMeta 各类输入 + wrapBlock→parse 往返）
+- tests/test_bidirectional_e2e.lua（端到端 mock Api 测试）
+
+**P4（UX 微调）**：
+- 首次启用后弹一次性 toast 告知 v3→v4 字段重命名
+- PDF 设备开 EPUB 推送过的笔记时，第一次见到无法拉取的 META 块弹警告
+- per-book 重置同步状态 UI
+
+### 今日工作流复盘
+
+按用户的"多阶段审查"工作流（feedback_multistage_review memory）：
+- 设计 → ✅（昨日完成 v4）
+- 自审 → ✅（Phase 2，找到 1 个 HIGH）
+- 多 agent → ✅（Phase 3，4 agent 找到 7 HIGH + 13 MED + 10 LOW）
+- 实施 → ✅（Day 1b + Day 2a + Day 2b）
+- DEBUG 日志 → ✅（Phase 1）
+- 实测看 crash.log → ⏳（待用户）
+
+**复盘观察**：自审 + 多 agent 重叠度高（_pull_in_flight 锁泄漏被自审 + silent-failure-hunter + code-reviewer 三方都找到），但 silent/security 找到了自审没覆盖的领域（XPointer 注入、note 大小 DoS、chapter 注入）。4 agent 并行值得。
+
+---
+
+## 明日计划
+
+用户回来后：
+
+1. **M7 Kindle 实测**（按 `progress/M7-Kindle-实测清单.md`）
+   - 优先级 P0：阶段 1（M5/M6 回归）+ 阶段 2-4（基础双向同步）
+   - 优先级 P1：阶段 7（版本不一致跳过验证）+ 阶段 8（PDF）
+   - 优先级 P2：阶段 9（异常路径）
+2. **根据实测结果**：
+   - 如果 crash.log 有 Lua stack trace → 分析 + 修复
+   - 如果实测全过 → 关闭 Task #5，M7 milestone 完成
+3. **M7 完成后**：选 M8 backlog 里的 P1 任务开始（文字搜索兜底是最高价值）
