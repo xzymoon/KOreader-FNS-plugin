@@ -18,14 +18,28 @@ Current implementation:
     - Failure handling: attempts++ → freeze at MAX_RETRY_ATTEMPTS(5);
       token-invalid (307/308) → freeze ALL + toast
     - Book file gone (renamed/deleted) → drop entry, don't burn attempts
+  - M7: Bidirectional sync (cross-device pull via three-way merge)
+    - bidirectional_sync_enabled gate (off by default; first-use privacy
+      confirmation dialog)
+    - Three-way merge: server_ts_set vs local_ts_set vs last_synced_ts_set
+      (per-book, persisted in G_reader_settings["fns_sync_last_synced"])
+    - Sync round = atomic unit (pull → merge → apply both → push → update
+      last); see _doSyncCurrentBookBidirectional
+    - Version mismatch handling: skip + warn, M8 will add text-search
+      fallback (see memory project-m7-version-mismatch)
+    - Format gate: only crengine formats support pull (EPUB/MOBI/AZW3/
+      FB2/TXT/HTML); PDF/CBZ/DJVU skip pull phase (rolling=false)
+    - Queue path (M6) bypasses bidirectional — always uses Legacy
+      (user decision #4: 离线书不做拉取)
 
 Stubbed:
-  - onSyncAllHistory (M7): walk history dir, batch sync per book
-  - sync_on_book_open (reserved for future pull-sync milestone)
+  - onSyncAllHistory (M8+): walk history dir, batch sync per book
 
 Not in scope:
-  - Cross-device conflict resolution (M7+)
   - Encryption of queue at rest (accepted risk, see config.lua PII note)
+  - Text-search fallback for cross-device book version mismatch (M8)
+  - Syncing note/color/drawer fields cross-device (M8)
+  - Per-book reset sync state UI (reset_config is the current fallback)
 
 @module fns_sync.main
 --]]--
@@ -313,6 +327,42 @@ end
 function FnsSync:_toggleBool(key)
     self.settings[key] = not self.settings[key]
     self:saveSettings()
+end
+
+--- M7: Toggle bidirectional sync with first-use privacy confirmation.
+-- First-time enable pops a ConfirmBox with the privacy notice (per design
+-- v4 + user decision #1, progress 2026-08-06). Subsequent toggles bypass
+-- the dialog (bidirectional_first_use_confirmed gates).
+-- Disabling is always silent (no "are you sure" — user intent is clear).
+function FnsSync:_toggleBidirectionalSync()
+    if self.settings.bidirectional_sync_enabled then
+        -- Turning OFF: simple toggle (consistent with other settings)
+        self:_toggleBool("bidirectional_sync_enabled")
+        return
+    end
+    -- Turning ON
+    if self.settings.bidirectional_first_use_confirmed then
+        -- Already confirmed before: silent toggle
+        self:_toggleBool("bidirectional_sync_enabled")
+        return
+    end
+    -- First-time enable: show privacy confirmation dialog
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = _("即将开启双向同步。\n\n【隐私告知】\n开启后，每条高亮会额外记录精确的 DOM 坐标（XPointer）到 Obsidian 笔记。如果 Obsidian vault 被共享/公开/入侵，攻击者可借此了解你的阅读进度和书籍结构。\n\n【数据流变化】\nObsidian 端的内容会同步回 KOreader。如果你在 Obsidian 删除了某条高亮，本设备的高亮也会被删除（跨设备同步删除）。\n\n【首次启用】\n首次启用会拉取服务器端的所有历史高亮到本设备。\n\n确认开启？"),
+        ok_text = _("开启"),
+        cancel_text = _("取消"),
+        ok_callback = function()
+            self.settings.bidirectional_sync_enabled = true
+            self.settings.bidirectional_first_use_confirmed = true
+            self:saveSettings()
+            logger.info("[FNS] bidirectional_sync_enabled=true (first-use confirmed)")
+            UIManager:show(InfoMessage:new{
+                text = _("双向同步已开启。\n\n下次同步时会自动拉取/推送差异。\n也可点\"立即拉取远端高亮\"手动触发。"),
+                timeout = 5,
+            })
+        end,
+    })
 end
 
 -- ===========================================================================
@@ -1629,6 +1679,49 @@ function FnsSync:addToMainMenu(menu_items)
                                 _("数字，默认 5"))
                         end,
                     },
+                    -- M7: Bidirectional sync (experimental, off by default)
+                    {
+                        text = _("双向同步（实验性）"),
+                        checked_func = function() return self.settings.bidirectional_sync_enabled end,
+                        enabled_func = function()
+                            return self.settings.enabled
+                               and self.settings.auto_sync_enabled
+                               and self:isConfigured()
+                        end,
+                        sub_item_table = {
+                            {
+                                text = _("启用双向同步"),
+                                checked_func = function() return self.settings.bidirectional_sync_enabled end,
+                                enabled_func = function()
+                                    return self.settings.enabled
+                                       and self.settings.auto_sync_enabled
+                                       and self:isConfigured()
+                                end,
+                                callback = function() self:_toggleBidirectionalSync() end,
+                            },
+                            {
+                                text = _("开书时自动拉取"),
+                                checked_func = function() return self.settings.pull_on_book_open end,
+                                enabled_func = function()
+                                    return self.settings.enabled
+                                       and self.settings.auto_sync_enabled
+                                       and self:isConfigured()
+                                       and self.settings.bidirectional_sync_enabled
+                                end,
+                                callback = function() self:_toggleBool("pull_on_book_open") end,
+                            },
+                            {
+                                text = _("说明"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    UIManager:show(InfoMessage:new{
+                                        text = _("双向同步（实验性）：\n\n开启后，本设备的 KOreader 高亮会与 Obsidian 笔记双向同步。\n\n- 在 Obsidian 删除 HL@ 块 = 跨设备删除本地高亮\n- 其他设备新增的高亮会自动拉到本设备\n- 每条高亮会额外记录 XPointer 坐标到 Obsidian 笔记\n\n仅支持 EPUB/MOBI/AZW3/FB2/TXT/HTML（crengine 格式），PDF 不支持拉取。"),
+                                        timeout = 10,
+                                    })
+                                end,
+                            },
+                        },
+                    },
                 },
                 separator = true,
             },
@@ -1758,6 +1851,18 @@ function FnsSync:addToMainMenu(menu_items)
                     return self.settings.enabled and self:isConfigured()
                 end,
                 callback = function() self:onSyncCurrentBook() end,
+            },
+            -- M7: manual pull button. Visible always, enabled only when
+            -- bidirectional_sync_enabled is on (greyed out otherwise as a
+            -- discoverability hint that the feature exists).
+            {
+                text = _("立即拉取远端高亮"),
+                enabled_func = function()
+                    return self.settings.enabled
+                       and self:isConfigured()
+                       and self.settings.bidirectional_sync_enabled
+                end,
+                callback = function() self:_pullRemoteHighlights() end,
             },
             {
                 text = _("立即同步全部历史"),
@@ -1943,11 +2048,10 @@ function FnsSync:addToMainMenu(menu_items)
                                 checked_func = function() return self.settings.sync_on_highlight end,
                                 callback = function() self:_toggleBool("sync_on_highlight") end,
                             },
-                            {
-                                text = _("开书同步"),
-                                checked_func = function() return self.settings.sync_on_book_open end,
-                                callback = function() self:_toggleBool("sync_on_book_open") end,
-                            },
+                            -- "开书同步" toggle removed in v4: was M5 placeholder
+                            -- referencing sync_on_book_open, which is now
+                            -- pull_on_book_open and lives under
+                            -- 自动同步 → 双向同步（实验性） → 开书时自动拉取.
                             {
                                 text = _("关书同步"),
                                 checked_func = function() return self.settings.sync_on_book_close end,

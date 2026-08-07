@@ -385,3 +385,95 @@ feat(M7): Day 2b/Commit 1 — config bump v4 + 字段重命名 + migration
 
 Day 2b/Commit 2: 菜单加"双向同步"子树 + "立即拉取"按钮 + 首次启用弹窗。
 ```
+
+---
+
+## Day 2b Commit 2：菜单改造 + 首次启用弹窗
+
+### 改动文件
+
+- `plugin/fns_sync.koplugin/main.lua`（+112 -8）
+
+### 改动详情（4 处）
+
+**1. 新增 `_toggleBidirectionalSync` 方法（含首次启用弹窗）**
+
+放在 `_toggleBool` 后面。逻辑：
+- 关闭双向同步：silent toggle（不弹"are you sure"）
+- 开启 + 已确认过：silent toggle
+- 开启 + 首次：弹 ConfirmBox（含隐私告知文案，per progress v4 设计 + 用户决策 #1）
+  - 用户点确认 → 设 `bidirectional_sync_enabled=true` + `bidirectional_first_use_confirmed=true` + 提示信息
+
+**2. "自动同步"子树末尾加"双向同步（实验性）"子树**
+
+```
+自动同步
+├─ 启用自动同步
+├─ 高亮修改时同步
+├─ 关闭书籍时同步
+├─ 同步延迟（秒）
+└─ 双向同步（实验性） [ ]  ← 新增
+   ├─ 启用双向同步 [ ]
+   ├─ 开书时自动拉取 [ ]
+   └─ 说明（弹出 InfoMessage 介绍功能）
+```
+
+enabled_func 链式：
+- "启用双向同步"：requires enabled + auto_sync_enabled + isConfigured
+- "开书时自动拉取"：上面 + bidirectional_sync_enabled（必须先开双向才能开拉取）
+
+**3. "立即同步当前书"后加"立即拉取远端高亮"按钮**
+
+按钮一直可见（discoverability hint），enabled 仅在 bidirectional_sync_enabled=true 时。callback 调 `_pullRemoteHighlights`（Commit 2 已实现）。
+
+**4. 删除"设置 → 触发模式 → 开书同步"项**
+
+原项引用 `sync_on_book_open`（v4 已废），是 M5 时的 placeholder 从未实际工作。删除后用注释说明原因（保留可追溯性）。
+
+### 行为不变性
+
+- DEFAULTS 中所有 M7 字段默认 false → 所有新菜单项 disabled 或不影响现有路径
+- 老用户升级 v3→v4 后：菜单看到"双向同步（实验性）[ ]"（关），"开书同步"项消失（原 placeholder）
+- 现有 M5/M6 路径完全不变
+
+### 首次启用弹窗文案（per progress v4 设计 line 270-286）
+
+```
+即将开启双向同步。
+
+【隐私告知】
+开启后，每条高亮会额外记录精确的 DOM 坐标（XPointer）到 Obsidian 笔记。
+如果 Obsidian vault 被共享/公开/入侵，攻击者可借此了解你的阅读进度和书籍结构。
+
+【数据流变化】
+Obsidian 端的内容会同步回 KOreader。如果你在 Obsidian 删除了某条高亮，
+本设备的高亮也会被删除（跨设备同步删除）。
+
+【首次启用】
+首次启用会拉取服务器端的所有历史高亮到本设备。
+
+确认开启？
+```
+
+按钮：「开启」/「取消」
+
+### 文件头注释更新
+
+main.lua 顶部模块说明：
+- 加 M7 一节（bidirectional_sync_enabled gate / 三路合并 / 同步回合 / 版本不一致处理 / 格式 gate / 队列强制 Legacy）
+- 删除 "Stubbed: sync_on_book_open"
+- "Not in scope" 加 M8 待办：文字搜索兜底 / note+color+drawer 同步 / per-book 重置 UI
+
+### Commit 信息
+
+```
+feat(M7): Day 2b/Commit 2 — 菜单加"双向同步"子树 + "立即拉取"按钮 + 首次启用弹窗
+
+- _toggleBidirectionalSync 方法（首次启用弹窗 + bidirectional_first_use_confirmed 防重弹）
+- "自动同步"子树末尾加"双向同步（实验性）"子树（3 项：toggle / 拉取 / 说明）
+- "立即同步当前书"后加"立即拉取远端高亮"按钮（enabled 链式）
+- 删除"设置 → 触发模式 → 开书同步"项（M5 placeholder，已被 pull_on_book_open 替代）
+- 文件头注释加 M7 一节，删过时 stub 项
+
+Day 2b 全部完成。下一步 Day 3：DEBUG 日志加足 + 自审 + 多 agent 审查。
+```
