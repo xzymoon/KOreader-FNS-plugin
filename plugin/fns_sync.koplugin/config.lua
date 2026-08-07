@@ -15,7 +15,7 @@ local Config = {}
 -- changes incompatibly (e.g. a template is restructured, a field is renamed).
 -- main.lua:init checks this against the version stored in G_reader_settings
 -- and runs the corresponding migration block when an older version is found.
-Config.CURRENT_CONFIG_VERSION = 3
+Config.CURRENT_CONFIG_VERSION = 4
 
 -- Single excerpt render template (rendered once per highlight, then wrapped
 -- in an HL@ block by excerpt.lua:renderExcerptBlock).
@@ -128,13 +128,33 @@ Config.DEFAULTS = {
     -- when offline (no WiFi prompt) — KOreader already persists highlights
     -- to local metadata.lua, so data is never lost; next open/close/manual
     -- sync will catch up.
-    -- sync_on_book_open is reserved for a future pull-sync milestone and
-    -- intentionally not wired in M5.
     auto_sync_enabled   = true,
     sync_on_highlight   = true,
-    sync_on_book_open   = false,  -- reserved, not implemented in M5
     sync_on_book_close  = true,
     debounce_seconds    = 5,
+
+    -- M7: Bidirectional sync (cross-device pull via three-way merge).
+    -- All three sub-switches additionally require `enabled` AND isConfigured()
+    -- AND auto_sync_enabled (bidirectional piggybacks on the M5 dispatcher).
+    --
+    -- bidirectional_sync_enabled: master gate. When true, _triggerSync routes
+    -- to _doSyncCurrentBookBidirectional (three-way merge with pull); when
+    -- false/nil, routes to _doSyncCurrentBookLegacy (M5/M6 push-only).
+    -- First-time enable pops a privacy confirmation dialog (see main.lua
+    -- menu code); bidirectional_first_use_confirmed gates that dialog.
+    --
+    -- pull_on_book_open: when true, onOpenDocument schedules a 2s-delayed
+    -- pull (lets crengine finish loading before HTTP + addItem batch).
+    -- Renamed from sync_on_book_open (M5 placeholder, never wired).
+    --
+    -- PRIVACY NOTE: bidirectional sync writes per-highlight XPointer
+    -- coordinates into the Obsidian note (so other devices can recreate
+    -- highlights at the correct position). If the vault is shared/public/
+    -- compromised, an attacker can infer reading progress and book structure
+    -- from these coordinates. The first-use dialog calls this out.
+    bidirectional_sync_enabled        = false,
+    pull_on_book_open                 = false,
+    bidirectional_first_use_confirmed = false,
 
     -- M6: Offline queue. When enabled, highlights created while offline are
     -- persisted to G_reader_settings["fns_sync_queue"] (keyed by book path)
@@ -145,6 +165,13 @@ Config.DEFAULTS = {
     -- has no per-key backup exclusion, so this data is included if the user
     -- exports/backups the global settings.lua. Don't put tokens or secrets
     -- in the queue.
+    --
+    -- M7 NOTE: queue path (M6) always uses Legacy push-only — even when
+    -- bidirectional_sync_enabled is true. Rationale: queued books are by
+    -- definition offline (queue fires on NetworkConnected), so pull has
+    -- nothing to fetch that's newer than local; and addItem requires the
+    -- book to be open (rare case for a queued book). See user decision #4
+    -- in progress 2026-08-06.
     offline_queue_enabled = true,
 }
 

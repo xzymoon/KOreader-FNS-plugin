@@ -101,6 +101,22 @@ function FnsSync:init()
             self.settings.excerpt_template = Config.DEFAULTS.excerpt_template
             logger.info("[FNS] migrated settings v2→v3: refreshed excerpt_template (new page/body layout)")
         end
+        -- v3 → v4 (M7): sync_on_book_open (M5 placeholder, never wired in
+        -- code) renamed to pull_on_book_open (M7 bidirectional pull trigger).
+        -- If user manually set sync_on_book_open=true (rare), carry over;
+        -- otherwise this is a no-op (DEFAULTS backfill already set
+        -- pull_on_book_open=false above). bidirectional_sync_enabled and
+        -- bidirectional_first_use_confirmed are net-new — no migration
+        -- needed (backfill sets them to false).
+        if prev_version < 4 then
+            if self.settings.sync_on_book_open ~= nil then
+                self.settings.pull_on_book_open = self.settings.sync_on_book_open
+                self.settings.sync_on_book_open = nil
+                logger.info("[FNS] migrated settings v3→v4: sync_on_book_open → pull_on_book_open")
+            else
+                logger.info("[FNS] migrated settings v3→v4: no rename needed (sync_on_book_open was nil)")
+            end
+        end
         self.settings.config_version = Config.CURRENT_CONFIG_VERSION
     end
 

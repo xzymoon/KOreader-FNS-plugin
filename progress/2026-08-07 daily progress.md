@@ -292,3 +292,96 @@ feat(M7): Day 2a/Commit 2 — _doSyncCurrentBookBidirectional + _pullRemoteHighl
 明日 Commit 3：onOpenDocument 加 scheduleIn(2s) → _pull_action（gated by pull_on_book_open）。
 Day 2b：config bump v4 + 菜单加"双向同步"子树 + "立即拉取"按钮 + 首次启用弹窗。
 ```
+
+---
+
+## Day 2a Commit 3：onOpenDocument 加 pull 钩子
+
+### 改动文件
+
+- `plugin/fns_sync.koplugin/main.lua`（+10 -0）
+
+### 改动详情
+
+`onOpenDocument` 函数末尾加：
+```lua
+if self.settings.bidirectional_sync_enabled and self.settings.pull_on_book_open then
+    logger.info("[FNS] onOpenDocument: scheduleIn(2s) → _pull_action (bidirectional pull)")
+    UIManager:scheduleIn(2, self._pull_action)
+end
+```
+
+### 行为不变性
+
+- `bidirectional_sync_enabled` 此时为 nil（Day 2b/Commit 1 才进 DEFAULTS）→ falsy → 不触发 pull
+- 即使 Day 2b 加默认值后，仍需用户手动开启两个开关才生效
+
+### 关键设计
+
+- 2s 延迟：让 ReaderUI 完全起来（特别是 crengine 加载 epub）再 fire HTTP + addItem batch
+- `_pull_action` 是 init 中分配的稳定 closure，`onCloseWidget` 能 unschedule 干净（避免 teardown 后死引用）
+
+---
+
+## Day 2b Commit 1：config bump v4 + 字段重命名 + migration
+
+### 改动文件
+
+- `plugin/fns_sync.koplugin/config.lua`（+35 -4）
+- `plugin/fns_sync.koplugin/main.lua`（+16 -0，仅 init 的 migration block）
+
+### 改动详情
+
+**1. config.lua: `CURRENT_CONFIG_VERSION = 3` → `4`**
+
+**2. config.lua DEFAULTS 字段调整**
+
+| 操作 | 字段 | 原因 |
+|------|------|------|
+| 删除 | `sync_on_book_open` | M5 占位字段，从未实际接线；v4 重命名为 `pull_on_book_open` |
+| 新增 | `bidirectional_sync_enabled = false` | M7 双向同步总开关 |
+| 新增 | `pull_on_book_open = false` | 开书自动拉取（替代 sync_on_book_open） |
+| 新增 | `bidirectional_first_use_confirmed = false` | 首次启用弹窗确认标志 |
+
+**3. config.lua 注释补充**
+- M7 字段说明（含隐私告知：XPointer 坐标会进 Obsidian 笔记）
+- M6 队列字段补充 M7 NOTE（队列强制走 Legacy，引用用户决策 #4）
+
+**4. main.lua:init 加 v3 → v4 migration block**
+
+```lua
+if prev_version < 4 then
+    if self.settings.sync_on_book_open ~= nil then
+        self.settings.pull_on_book_open = self.settings.sync_on_book_open
+        self.settings.sync_on_book_open = nil
+        logger.info("[FNS] migrated settings v3→v4: sync_on_book_open → pull_on_book_open")
+    else
+        logger.info("[FNS] migrated settings v3→v4: no rename needed (sync_on_book_open was nil)")
+    end
+end
+```
+
+### 老用户升级路径
+
+| 老版本 | 老字段值 | v4 升级后 |
+|--------|---------|----------|
+| v3（默认） | `sync_on_book_open = false` | `pull_on_book_open = false`（DEFAULTS backfill + migration 覆盖）|
+| v3（用户手动 true） | `sync_on_book_open = true` | `pull_on_book_open = true`（用户意图保留）|
+| v1/v2（无 sync_on_book_open） | 字段不存在 | `pull_on_book_open = false`（DEFAULTS backfill）|
+
+### 行为不变性
+
+- DEFAULTS 中所有 M7 字段都默认 false → dispatcher 仍走 Legacy
+- "触发模式"子菜单里仍有 `sync_on_book_open` 引用（line 1485 区域）—— Commit 2 菜单改造会清理
+
+### Commit 信息
+
+```
+feat(M7): Day 2b/Commit 1 — config bump v4 + 字段重命名 + migration
+
+- CURRENT_CONFIG_VERSION 3 → 4
+- DEFAULTS: 删除 sync_on_book_open（M5 占位），新增 3 个 M7 字段
+- main.lua:init 加 v3→v4 migration（sync_on_book_open → pull_on_book_open）
+
+Day 2b/Commit 2: 菜单加"双向同步"子树 + "立即拉取"按钮 + 首次启用弹窗。
+```
