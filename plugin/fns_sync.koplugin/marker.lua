@@ -317,7 +317,12 @@ function Marker.applyDiff(existing_segments, actions)
                 logger.info("[FNS] deleting HL@ block ts=" .. tostring(seg.ts))
             elseif a.op == "update" then
                 logger.info("[FNS] updating HL@ block ts=" .. tostring(seg.ts))
-                table.insert(after_inplace, { type = "hl", ts = seg.ts, content = a.content })
+                -- M7: carry action.meta (from current_meta_map or preserved seg.meta)
+                -- so pos0/pos1/chapter round-trip through update. Match parse()
+                -- pattern: only attach meta when non-nil to keep old notes clean.
+                local new_seg = { type = "hl", ts = seg.ts, content = a.content }
+                if a.meta then new_seg.meta = a.meta end
+                table.insert(after_inplace, new_seg)
             end
             -- "insert" should never target an existing ts; skip silently.
         else
@@ -340,7 +345,11 @@ function Marker.applyDiff(existing_segments, actions)
     for _, ins in ipairs(inserts) do
         local pos = findInsertionPoint(after_inplace, ins.ts)
         logger.info("[FNS] inserting HL@ block ts=" .. tostring(ins.ts) .. " at position " .. pos)
-        table.insert(after_inplace, pos, { type = "hl", ts = ins.ts, content = ins.content })
+        -- M7: carry ins.meta (from current_meta_map) so newly inserted HL@ blocks
+        -- ship with pos0/pos1/chapter for cross-device re-creation.
+        local new_seg = { type = "hl", ts = ins.ts, content = ins.content }
+        if ins.meta then new_seg.meta = ins.meta end
+        table.insert(after_inplace, pos, new_seg)
     end
 
     return after_inplace
