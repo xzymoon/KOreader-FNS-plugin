@@ -136,15 +136,18 @@ function Markdown:renderExcerptBlock(annotations, settings)
     local use_chapter = settings.show_chapter_subtitle ~= false
     local result = {}
     local last_chapter = nil
+    local chapter_count = 0
 
     for _, ann in ipairs(list) do
         local excerpt = self:renderExcerpt(ann, settings)
         if use_chapter and ann.chapter and ann.chapter ~= ""
             and ann.chapter ~= last_chapter then
+            -- Increment chapter counter when chapter changes
+            chapter_count = chapter_count + 1
             -- Chapter heading directly above the excerpt body, no blank line
             -- in between (visual density requested by users). The excerpt
             -- itself already starts with `> 📖 第 N 页`.
-            excerpt = "## " .. ann.chapter .. "\n" .. excerpt
+            excerpt = "## " .. chapter_count .. "：" .. ann.chapter .. "\n" .. excerpt
             last_chapter = ann.chapter
         end
         -- Index by datetime; later ann with same datetime would overwrite

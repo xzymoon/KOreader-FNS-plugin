@@ -278,25 +278,14 @@ end
 --- Find the index in segments where a new HL@ block with given ts should be inserted.
 -- Strategy:
 --   1. If any HL@ block has ts > new_ts, insert before the first such block.
---   2. Otherwise, insert right after the last HL@ block.
---   3. If there are no HL@ blocks at all, append at end (after all user content).
+--   2. Otherwise, append at the end of the file (after all USER content).
 local function findInsertionPoint(segments, new_ts)
     for idx, seg in ipairs(segments) do
         if seg.type == "hl" and seg.ts > new_ts then
             return idx
         end
     end
-
-    local last_hl = 0
-    for idx, seg in ipairs(segments) do
-        if seg.type == "hl" then
-            last_hl = idx
-        end
-    end
-    if last_hl > 0 then
-        return last_hl + 1
-    end
-
+    
     return #segments + 1
 end
 
