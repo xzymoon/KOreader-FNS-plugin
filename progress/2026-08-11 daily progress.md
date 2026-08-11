@@ -2,7 +2,9 @@
 
 ## 主要任务
 
-修复 `marker.lua` 的 `findInsertionPoint` bug：当笔记结构是「HL@ 块 + USER 笔记」时，新高亮会被错误地插到 USER 笔记**之前**，而非文件末尾。附带一个 `excerpt.lua` 章节标题加序号的 UX 增强。Kindle 实测验证通过。
+**上午 + 下午（M7 收尾）**：修复 `marker.lua` 的 `findInsertionPoint` bug（USER 笔记在最后一条 HL@ 块之后时新高亮会插错位置），附带 `excerpt.lua` 章节标题加序号的 UX 增强。Kindle 实测验证通过。
+
+**晚间（M8 启动）**：完成 AI 对话功能的 brainstorming，输出设计规格文档。M7 实测和 M8 backlog 暂时搁置，先做用户提出的新功能。
 
 ## 故障经过（一次错误归因 → 重新诊断 → 验证通过）
 
@@ -86,26 +88,80 @@
 
 ---
 
-## 今日 commit 计划
+## 今日 commit 实际
 
-**改动文件**：
-- 修改：`plugin/fns_sync.koplugin/marker.lua`（+2 -13）
-- 修改：`plugin/fns_sync.koplugin/excerpt.lua`（+4 -1）
-- 新增：`progress/2026-08-11 daily progress.md`
+| Commit | 内容 |
+|--------|------|
+| `51a7018` | fix(M7): marker.lua findInsertionPoint 修复 + excerpt.lua 章节序号 |
+| `5f3705b` | chore: .gitignore 加 .ua/（Understanding Anything 插件本地配置） |
+| `7aa7a1d` | docs(M8): AI 对话功能设计规格（brainstorming 完成） |
 
-**建议 commit message**：
+本地 ahead origin/master **15 个 commit**（按习惯不 push，等 Kindle 实测稳定）。
 
-```
-fix(M7): marker.lua findInsertionPoint 修复 + excerpt.lua 章节序号
+---
 
-marker.lua: 删掉 findInsertionPoint 的 Strategy 2（last_hl + 1）。
-该策略在「USER 笔记在最后一条 HL@ 块之后」的场景下会把新高亮
-插到 USER 笔记之前（last_hl + 1 = USER笔记索引）。改后统一走
-Strategy 3（#segments + 1 = 真正末尾）。Case 分析见 progress。
+## 晚间新增：M8 AI 对话功能 brainstorming
 
-excerpt.lua: renderExcerptBlock 加 chapter_count，章节标题格式
-从 "## 章节名" 改为 "## 1：章节名"。独立 UX 增强，不影响同步。
+### 起点
 
-Kindle 实测：2026-08-11 19:45，HL@ 正确出现在 USER 笔记之后。
-crash.log: inserting HL@ block ts=... at position 92（#segments+1）。
-```
+用户提出新功能需求：高亮 → 问 AI → 多轮对话 → 让 AI 总结 → 加到笔记。M7 完整实测和 M8 backlog 都暂时搁置，先做这个。
+
+### 流程
+
+按 `brainstorming` skill 流程：
+1. 探索项目上下文（已知 M1-M7 状态、M8 backlog）
+2. 澄清问题（每次一个）：使用场景 / AI 服务 / 架构方案 / 单轮 vs 多轮
+3. 分节展示设计（§1 UI / §2 笔记格式 / §3 配置 / §4 实现细节），每节确认
+4. 编写设计文档 + 规格 self-check
+5. commit
+
+### 关键决策
+
+| 决策点 | 选定 | 备选 | 理由 |
+|--------|------|------|------|
+| 架构方案 | A: Kindle 直连 | B: FNS server 中转 / C: 直连+代理 | Simplicity First，不动 FNS server |
+| AI 服务 | DeepSeek（OpenAI 兼容）| 通义/智谱/OpenAI/Claude/Ollama | 国内便宜不需代理，OpenAI API 通用 |
+| UI 流程 | 链式对话框（InputDialog + TextViewer）| 自写聊天窗口组件 | 复用现有组件，复杂度 1/3 |
+| 笔记格式 | 独立 AI@ 块 | 扩展 HL@ 块 / 纯文本 | HL@ 零修改，M5/M6/M7 零回归 |
+| API key 管理 | USB 编辑 ai_config.lua | 加密 / FNS server 代管 | YAGNI，跟 FNS token 同安全级 |
+| 多轮对话 | 累积上下文重发 | 流式 / 持久化历史 | 简单，DeepSeek token 便宜 |
+
+### 输出物
+
+`docs/superpowers/specs/2026-08-11-ai-chat-design.md`（363 行设计规格，12 节）：概述 / 用户故事 / 架构 / UI / 笔记格式 / 配置 / 实现细节 / YAGNI / 演进 / 验收 / 风险 / 参考。
+
+### YAGNI 边界（明确不做）
+
+不存对话历史 / 不做流式 / 不多 API 并发 / 不重新生成 / 不加密 key / 不支持图片 / 不做对话导出。
+
+### 下一步
+
+用户审查规格 → 调用 `writing-plans` skill 创建实现计划 → 进入编码。
+
+---
+
+## 今日总结
+
+### 完成情况
+
+| 维度 | 状态 |
+|------|------|
+| M7 marker.lua findInsertionPoint bug 修复 | ✅ Kindle 实测通过 |
+| excerpt.lua 章节序号 UX 增强 | ✅ Kindle 实测通过 |
+| .gitignore 加 .ua/ | ✅ |
+| M8 AI 对话功能 brainstorming | ✅ 设计规格完成 |
+| M8 实现计划（writing-plans） | ⏳ 明天继续 |
+| M8 编码实施 | ⏳ 明天继续 |
+
+### 两个非显然的经验教训
+
+1. **错误归因的代价**：下午同步失败第一反应是「代码改坏了」→ stash 回滚。其实是网络 timeout。下次先看 `crash.log` 区分 Lua 异常 vs 网络问题，再决定动不动代码（30 秒能确定）。
+
+2. **brainstorming skill 的价值**：通过 4 轮逐个问题澄清 + 4 节分节展示设计，把"想做 AI 对话功能"这种模糊想法，转化为 12 节具体可实施的设计文档。每次只问一个问题、每节展示后确认，避免了一次性抛大设计导致用户难以审查。
+
+### 明日计划
+
+1. 用户审查 M8 设计规格（用户已经过目，等明天确认）
+2. 调用 `writing-plans` skill 创建 M8 实现计划
+3. 按计划分 commit 实施（估计 4-6 个 commit：`ai.lua` / `ai_config.lua` / `marker.lua` 扩展 / `main.lua` 注册 / `config.lua` 加字段）
+4. Kindle 实测 M8 AI 对话功能
