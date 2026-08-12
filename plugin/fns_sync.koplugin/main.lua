@@ -78,9 +78,14 @@ local FnsSync = WidgetContainer:extend{
 function FnsSync:init()
     self.settings = G_reader_settings:readSetting("fns_sync", {})
     -- Backfill any missing defaults (preserves user values already set).
-    -- NOTE: table-typed defaults are assigned by reference. No menu today
-    -- mutates them, so this is safe; revisit (deep copy) when M5 adds
-    -- color-emoji-map editing.
+    -- NOTE: table-typed defaults are assigned by reference. Today these are:
+    --   - color_emoji_map (M4): no menu mutates it
+    --   - ai_quick_prompts (M8): Task D menu must mutate per-subkey
+    --     (self.settings.ai_quick_prompts.translate = x is OK;
+    --      self.settings.ai_quick_prompts = { translate = x } is NOT —
+    --      that detaches from DEFAULTS but only after first mutation,
+    --      earlier user's value lived on the DEFAULTS ref).
+    -- Revisit (deep copy) if a third mutating menu appears.
     for k, v in pairs(Config.DEFAULTS) do
         if self.settings[k] == nil then
             self.settings[k] = v

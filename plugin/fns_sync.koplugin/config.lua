@@ -208,7 +208,12 @@ Config.DEFAULTS = {
 
     -- Quick prompt templates for the [翻译][解释][评论] buttons in the
     -- InputDialog. Each is prefixed to the highlighted text on send.
-    -- {text} placeholder is replaced with the highlight content.
+    --
+    -- Placeholder convention: literal `{text}` substring (NOT %s /
+    -- string.format). Replaced via input_text:gsub("{text}", highlight)
+    -- in Task B/D caller. If user deletes `{text}`, the prompt is sent
+    -- as-is without the highlight (intended — user might want a fixed
+    -- prompt that doesn't echo the excerpt).
     ai_quick_prompts = {
         translate = "请把下面这段话翻译成中文：\n\n{text}",
         explain   = "请解释下面这段话的背景和含义：\n\n{text}",
