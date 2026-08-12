@@ -15,7 +15,7 @@ local Config = {}
 -- changes incompatibly (e.g. a template is restructured, a field is renamed).
 -- main.lua:init checks this against the version stored in G_reader_settings
 -- and runs the corresponding migration block when an older version is found.
-Config.CURRENT_CONFIG_VERSION = 4
+Config.CURRENT_CONFIG_VERSION = 5
 
 -- Single excerpt render template (rendered once per highlight, then wrapped
 -- in an HL@ block by excerpt.lua:renderExcerptBlock).
@@ -186,6 +186,40 @@ Config.DEFAULTS = {
     -- book to be open (rare case for a queued book). See user decision #4
     -- in progress 2026-08-06.
     offline_queue_enabled = true,
+
+    -- M8: AI assistant. All AI config lives here (NOT in a separate
+    -- ai_config.lua file — that would re-introduce the require cache bug
+    -- from 2026-08-12 rollback). User edits via menu (_editString), values
+    -- persist into G_reader_settings["fns_sync"] like every other setting.
+    --
+    -- SECURITY: ai_api_key is stored in plaintext, same trust level as the
+    -- FNS api_token. KOreader's settings.reader.lua is plaintext on the
+    -- Kindle filesystem; encryption would only defend against a USB snoop,
+    -- not a stolen device. Mitigation: user rotates key at DeepSeek console
+    -- if Kindle is lost.
+    ai_enabled      = false,
+    ai_api_base     = "https://api.deepseek.com/v1",
+    ai_api_key      = "",
+    ai_model        = "deepseek-chat",
+    ai_system_prompt = "你是一个阅读助手，根据用户的高亮和问题给出简洁有用的回答。",
+    ai_max_tokens   = 1024,
+    ai_temperature  = 0.7,
+    ai_timeout_sec  = 30,
+
+    -- Quick prompt templates for the [翻译][解释][评论] buttons in the
+    -- InputDialog. Each is prefixed to the highlighted text on send.
+    -- {text} placeholder is replaced with the highlight content.
+    ai_quick_prompts = {
+        translate = "请把下面这段话翻译成中文：\n\n{text}",
+        explain   = "请解释下面这段话的背景和含义：\n\n{text}",
+        comment   = "请简要评论下面这段话的观点：\n\n{text}",
+    },
 }
+
+-- M8: HTTP timeouts for AI API calls (block, total). Larger than FNS's
+-- LARGE_*_TIMEOUT (10/30) because DeepSeek's reasoning can take 30s.
+-- Reference: kosync.koplugin uses per-scenario timeout tables too.
+-- Used by ai.lua via socketutil:set_timeout(unpack(Config.AI_HTTP_TIMEOUTS)).
+Config.AI_HTTP_TIMEOUTS = { 10, 60 }
 
 return Config

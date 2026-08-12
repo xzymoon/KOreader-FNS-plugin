@@ -131,6 +131,17 @@ function FnsSync:init()
                 logger.info("[FNS] migrated settings v3→v4: no rename needed (sync_on_book_open was nil)")
             end
         end
+
+        -- v4 → v5 (M8): AI assistant fields added (ai_enabled, ai_api_base,
+        -- ai_api_key, ai_model, ai_system_prompt, ai_max_tokens,
+        -- ai_temperature, ai_timeout_sec, ai_quick_prompts). DEFAULTS
+        -- backfill above already sets them to defaults; no explicit
+        -- migration needed unless we want to refresh user-modified values.
+        -- This block is intentionally a no-op log marker for traceability.
+        if prev_version < 5 then
+            logger.info("[FNS] migrated settings v4→v5: AI fields backfilled from DEFAULTS")
+        end
+
         self.settings.config_version = Config.CURRENT_CONFIG_VERSION
     end
 
