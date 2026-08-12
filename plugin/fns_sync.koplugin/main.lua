@@ -215,6 +215,62 @@ function FnsSync:init()
     else
         logger.info("[FNS] init: offline, waiting for onNetworkConnected")
     end
+
+    -- M8: Register "Ask AI" button in highlight menu. Uses KOReader's
+    -- official addToHighlightDialog hook (see qrclipboard.koplugin/main.lua
+    -- for reference). Previous attempt (2026-08-12 rollback) tried to
+    -- override onShowHighlightMenu event — that event is NOT broadcast by
+    -- KOReader; the correct mechanism is registration via this method.
+    -- The button shows up in BOTH entry paths (select-new-text AND
+    -- long-press-existing-highlight → "…" → menu).
+    if self.ui and self.ui.highlight and self.document then
+        self.ui.highlight:addToHighlightDialog("12_fns_ask_ai", function(this)
+            return {
+                text = _("问 AI"),
+                show_in_highlight_dialog_func = function()
+                    -- Only show when AI is enabled AND api_key is set
+                    return self.settings.ai_enabled == true
+                       and self.settings.ai_api_key ~= nil
+                       and self.settings.ai_api_key ~= ""
+                end,
+                callback = function()
+                    -- Capture selected text eagerly — clear() may run
+                    -- before our callback's UIManager:nextTick fires.
+                    local selected_text
+                    if this.selected_text and this.selected_text.text then
+                        selected_text = this.selected_text.text
+                    elseif this.selected_text and this.selected_text.pos0 and this.selected_text.pos1 then
+                        -- Fallback: extract via document API if available
+                        if this.ui.document and this.ui.document.getTextFromXPointers then
+                            selected_text = this.ui.document:getTextFromXPointers(
+                                this.selected_text.pos0, this.selected_text.pos1)
+                        end
+                    end
+
+                    -- Close the highlight menu but keep the highlight itself
+                    -- (true = don't clear selection). Pattern from qrclipboard.
+                    if this.onClose then this:onClose(true) end
+
+                    -- Task D will replace this placeholder with real dialog.
+                    -- For now, surface captured text length so we can verify
+                    -- the hook works on device.
+                    local preview = (selected_text or ""):sub(1, 30)
+                    UIManager:show(InfoMessage:new{
+                        text = string.format(_("问 AI（开发中）\n选区：%d 字符\n%s…"), #(selected_text or ""), preview),
+                        timeout = 3,
+                    })
+                    logger.info("[FNS-AI] ask-ai button clicked, selected_text len=" .. tostring(selected_text and #selected_text))
+
+                    -- Defer clear() so the InfoMessage shows cleanly above
+                    -- the dismissed menu (qrclipboard main.lua:54-56 pattern).
+                    UIManager:scheduleIn(0.1, function()
+                        if this.clear then this:clear() end
+                    end)
+                end,
+            }
+        end)
+        logger.info("[FNS] registered '问 AI' button in highlight menu")
+    end
 end
 
 function FnsSync:saveSettings()
