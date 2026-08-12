@@ -18,7 +18,6 @@ local ltn12 = require("ltn12")
 local rapidjson = require("rapidjson")
 local socket = require("socket")
 local socketutil = require("socketutil")
-local util = require("util")
 local _ = require("gettext")
 
 local Config = require("config")
