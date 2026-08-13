@@ -244,7 +244,158 @@
 
 ## 文档产出
 
-- `progress/2026-08-13 daily progress.md` — 本文档
+- `progress/2026-08-13 daily progress.md` — 本文档（Task D 部分）
 - `plugin/fns_sync.koplugin/main.lua` — Task D 4 条修复落地
 - `plugin/fns_sync.koplugin/config.lua` — summarize 字段
+- `tests/test_config_ai.lua` — summarize 字段断言
+
+---
+
+# 阶段七-十二：Task E-step1（AI@ 块 + 加入笔记功能）
+
+下午-晚上继续 Task E（M8 最后一个任务）。经过 5 轮决策迭代 + 架构师方案审查 + 实施者 + 两轮代码审查 + 6 项必修修复，最终 commit。
+
+## 决策迭代过程
+
+5 轮才拍板（用户深度参与）：
+
+| 轮次 | 议题 | 用户决策 |
+|------|------|---------|
+| 1 | 5 个产品决策首拍 | emoji→文字 / 3 固定模板 / summarize 可配置 / 60 字截断 / AI 菜单解耦 FNS |
+| 2 | 加到笔记内容范围 | 取最后一条 assistant（配合"让 AI 总结"工作流）|
+| 3 | AI@ 与 HL@ 关系 | 方案 Z（独立 AI@ 块紧贴 HL@ 之后）|
+| 4 | UI 提示方式 | C-2（TextViewer 顶部固定提示 + 简洁按钮"加入笔记"）|
+| 5 | 方案审查后重新拍板 | HL@ ts 用方案 A（自动 saveHighlight）/ debounce 3 秒 / fallback 末尾追加 / bidirectional 也 drain |
+
+## 阶段八：方案审查（architect agent）
+
+实施前用 architect agent 审查方案，发现：
+- **2 CRITICAL**：决策 5 HL@ ts 捕获在主入口下不可行（入口 A selected_text.datetime 是 nil）/ 决策 4 ts 唯一性问题
+- **3 HIGH**：bidirectional 路径不 drain / 写入失败 UX / fallback 策略
+
+用户重新拍板后整理最终方案，避开坑。
+
+## 阶段九：实现者子代理
+
+完整 5 块改动粘贴给 general-purpose 子代理：
+
+1. marker.lua 扩展（TDD，AI@ 块 parse/serialize/diff 不参与）
+2. Task C callback 改造（自动 saveHighlight + 反查 hl_ts）
+3. _openAiInputDialog 扩展（接收 hl_ts）
+4. _openAiResponseViewer 改动（顶部提示 + 加入笔记按钮 + debounce 3 秒）
+5. 新增 _addAiContentToNote + 三路径 drain（Legacy / Bidirectional / 首次创建笔记）
+
+**测试结果**：marker_ai 21 项 / threeway 19 项 / config_ai 17 项全 PASS。
+
+## 阶段十：规格合规审查（独立 general-purpose 子代理）
+
+发现 1 个 CRITICAL：
+
+### CRITICAL-1：serialize→parse→serialize 非幂等
+
+- **现象**：每次同步笔记，HL@ 块和 AI@ 块之间多一个空行，用久笔记无限膨胀
+- **根因**：`_wrapAiBlock` 把 `\n\n` 藏在块头部，parse 当 user segment 捕获，下次 serialize 累积
+- **修复**：移除 `_wrapAiBlock` 前置 `\n\n`，改由 serialize 在 AI@ 分支显式控制分隔符
+  - HL@ → AI@：`\n\n`（一个空行段落分隔）
+  - AI@ → AI@：`\n`（紧贴堆叠，决策 4）
+  - user → AI@：不加（user 自带换行）
+- **新增 4 项幂等性测试断言**到 test_marker_ai.lua（HL@→AI@ / 多 AI@ 堆叠 / AI@→HL@ 三个场景）
+
+修复后三个测试全 PASS（25+19+17）。
+
+## 阶段十一：代码质量审查（code-reviewer agent）
+
+发现 5 HIGH + 4 MEDIUM + 4 LOW。6 项必修：
+
+| # | 问题 | 修复方案 |
+|---|------|---------|
+| H-1 | 首次创建笔记不 drain（数据丢失）| 抽 `_drainPendingAiBlocks(segments, book_path)` helper，三路径共用 |
+| H-2 | pending 不持久化 + toast 误导（crash 丢失）| `_savePendingAi` / `_loadPendingAi` + init() 加载（仿 M6 _saveQueue）|
+| H-3 | 双触发同步（saveHighlight + _triggerSync 浪费 API）| `_addAiContentToNote` 前 `_cancelAutoSyncTimer` |
+| H-4 | AI@ 反向堆叠（后入队的反而排前面）| drain 用 `last_idx_by_hl_ts` 记录位置，保序堆叠 |
+| H-5 | 跨书污染（A 书 pending 写入 B 书笔记）| pending 加 `book_path` 字段，drain 按 book_path 过滤 |
+| LOW-4 | fallback orphaned 无标识 | drain 末尾追加时 AI@ meta 加 `orphaned="true"` |
+
+跳过的 MEDIUM/LOW（记入 backlog）：M-1 drain 失败恢复 / M-2 反查 annotations 可能错配 / M-3 bidirectional 边界 / M-4 user→AI@ 粘连边界 / L-1/L-2/L-3 cosmetic。
+
+## 阶段十二：6 项必修修复 + 测试 + commit
+
+8 处改动（surgical）：
+
+1. `marker.lua AI_META_KEYS` 加 `orphaned`
+2. `main.lua` 加 3 个 helper：`_drainPendingAiBlocks` / `_savePendingAi` / `_loadPendingAi`
+3. `main.lua init()` 末尾加 `_loadPendingAi` 调用
+4. `main.lua _addAiContentToNote` 加 book_path + 持久化 + unschedule M5 timer
+5. `main.lua` Legacy drain 替换为 helper 调用（line ~1077）
+6. `main.lua` first-create 分支加 drain（H-1 关键修复）
+7. `main.lua` Bidirectional drain 替换为 helper 调用（line ~1413）
+8. （隐含）drain 逻辑统一到 helper 内（含 H-4 保序 + H-5 过滤 + LOW-4 orphaned）
+
+**测试**：marker_ai 25 项（原 21 + 幂等 4）/ threeway 19 项 / config_ai 17 项全 PASS。
+
+**Commit**：`66852a0` feat(M8 Task E-step1): AI@ 块 + 加入笔记功能（marker.lua 扩展 + 三路径 drain）
+
+分支 `feat/m8-ai-chat` 现 ahead **9 个 commit**（未 push）。
+
+---
+
+## 当前 M8 进度
+
+| Task | 状态 | Commit |
+|------|------|--------|
+| A 配置基础设施 | ✅ | a55ac37 + 3629f51 |
+| B ai.lua HTTP 调用 | ✅ | a33fbb3 + 688144e |
+| C 高亮菜单按钮 | ✅ | 740cf57 |
+| D 链式对话框 UI | ✅ | 70a0fa2 |
+| **E-step1 AI@ 块 + 加笔记** | ✅ commit 完成，等 Kindle 实测 | 66852a0 |
+| E-step2 多选 UI（M9）| ⏳ 推迟到远期 |
+
+M8 完成度：**主功能全部实现，等 Kindle 最终实测验收**。
+
+---
+
+## 子代理工作流经验（Task E 复盘）
+
+### 成功点
+
+1. **方案审查提前**：architect agent 在实施前审查方案，发现 2 CRITICAL + 3 HIGH，避免实施后返工
+2. **drain 时机 bug 由用户提问揪出**：用户问"为什么 AI@ 找不到 HL@"让我重新审视代码，发现 plan 原案"drain 在 parse 之后"是错的，应该是"applyDiff 之后"。这次审查者也没发现，是用户的不倦提问救了项目
+3. **幂等性是核心 invariant**：marker.lua 一直保证 `serialize(parse(x))` 幂等，CRITICAL-1 打破了这个 invariant。补的 4 项幂等性测试是 long-term guard
+4. **三阶段审查有效拦住 6 项必修**：实现者 → 规格审查（发现 CRITICAL-1）→ 代码质量审查（发现 5 HIGH + LOW-4）
+
+### 教训
+
+1. **plan 也会错**：plan 是 8月12日写的，plan 作者对 KOreader saveHighlight 时机理解错误（以为入口 A 也有 datetime）。审查阶段 + 用户提问共同发现并修正
+2. **drain helper 抽取得当**：H-1 修复时把 drain 抽成 helper，三路径都用，避免代码重复 + 确保 bidirectional 和 first-create 不漏 drain
+3. **持久化 pattern 复用**：`_savePendingAi` 复用 M6 `_saveQueue` 的 G_reader_settings 模式，crash 恢复保证一致
+
+---
+
+## 明日计划
+
+### Task E-step1 Kindle 实测（用户即将做）
+
+完整 10 步流程 + 错误/边界场景 + 关键验收点：
+- 长按新文字**自动产生高亮**（方案 A 副作用）
+- AI@ 块**精确紧贴对应 HL@**（不是末尾追加）
+- **幂等性**：多次同步空行不增加（CRITICAL-1 修复）
+- M5/M6/M7 零回归
+
+### Task E-step2（M9 远期）
+
+完整复选 UI（用户决策：远期实现）。
+
+### M8 完整收尾
+
+实测通过后可考虑 push 到 master。
+
+---
+
+## 文档产出（最终）
+
+- `progress/2026-08-13 daily progress.md` — 本文档（含 Task D + Task E-step1）
+- `plugin/fns_sync.koplugin/main.lua` — Task D 4 条修复 + Task E-step1 6 条修复
+- `plugin/fns_sync.koplugin/marker.lua` — AI@ 扩展 + orphaned meta + serialize 重构
+- `plugin/fns_sync.koplugin/config.lua` — summarize 字段
+- `tests/test_marker_ai.lua` — 25 项断言（含 4 项幂等性 guard）
 - `tests/test_config_ai.lua` — summarize 字段断言
