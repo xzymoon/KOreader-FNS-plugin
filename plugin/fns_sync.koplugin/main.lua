@@ -46,6 +46,7 @@ Not in scope:
 
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
+local TextViewer = require("ui/widget/textviewer")
 local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -55,6 +56,7 @@ local logger = require("logger")
 
 local Config = require("config")
 local Api = require("api")
+local Ai = require("ai")
 local Excerpt = require("excerpt")
 local Marker = require("marker")
 local Threeway = require("threeway")
@@ -69,6 +71,12 @@ local FnsSync = WidgetContainer:extend{
     -- Trade-off: FileManager-only online events won't drain the queue;
     -- user must open a book. Acceptable given typical reading flow.
     is_doc_only = true,
+    -- M8: AI assistant runtime state (per-session, NOT persisted).
+    -- _ai_session is nil when no AI conversation is active; otherwise a
+    -- table { original_text = "...", messages = { {role, content}, ... } }.
+    -- Reset on: book close, ReaderUI teardown, user clicks "关闭".
+    -- A fresh "问 AI" button click starts a new session.
+    _ai_session = nil,
 }
 
 -- ===========================================================================
@@ -78,17 +86,21 @@ local FnsSync = WidgetContainer:extend{
 function FnsSync:init()
     self.settings = G_reader_settings:readSetting("fns_sync", {})
     -- Backfill any missing defaults (preserves user values already set).
-    -- NOTE: table-typed defaults are assigned by reference. Today these are:
-    --   - color_emoji_map (M4): no menu mutates it
-    --   - ai_quick_prompts (M8): Task D menu must mutate per-subkey
-    --     (self.settings.ai_quick_prompts.translate = x is OK;
-    --      self.settings.ai_quick_prompts = { translate = x } is NOT —
-    --      that detaches from DEFAULTS but only after first mutation,
-    --      earlier user's value lived on the DEFAULTS ref).
-    -- Revisit (deep copy) if a third mutating menu appears.
+    -- M8 Task D fix (reviewer H-1): table-typed defaults are one-level
+    -- shallow-copied so nested-key edits via _editString (e.g.
+    -- "ai_quick_prompts.translate") don't mutate Config.DEFAULTS by
+    -- reference. Sufficient for {string: string} maps like color_emoji_map
+    -- and ai_quick_prompts. Deeper structures (e.g. book_overrides) are
+    -- populated by their own helpers, not via _editString.
     for k, v in pairs(Config.DEFAULTS) do
         if self.settings[k] == nil then
-            self.settings[k] = v
+            if type(v) == "table" then
+                local copy = {}
+                for tk, tv in pairs(v) do copy[tk] = tv end
+                self.settings[k] = copy
+            else
+                self.settings[k] = v
+            end
         end
     end
 
@@ -235,34 +247,32 @@ function FnsSync:init()
                 end,
                 callback = function()
                     -- Capture selected text eagerly — clear() may run
-                    -- before our callback's UIManager:nextTick fires.
+                    -- before our dialog opens. Pattern from qrclipboard.
                     local selected_text
                     if this.selected_text and this.selected_text.text then
                         selected_text = this.selected_text.text
                     elseif this.selected_text and this.selected_text.pos0 and this.selected_text.pos1 then
-                        -- Fallback: extract via document API if available
                         if this.ui.document and this.ui.document.getTextFromXPointers then
                             selected_text = this.ui.document:getTextFromXPointers(
                                 this.selected_text.pos0, this.selected_text.pos1)
                         end
                     end
 
-                    -- Close the highlight menu but keep the highlight itself
-                    -- (true = don't clear selection). Pattern from qrclipboard.
+                    if not selected_text or selected_text == "" then
+                        UIManager:show(InfoMessage:new{ text = _("未获取到选区文本"), timeout = 2 })
+                        return
+                    end
+
+                    -- Close the highlight menu (keep highlight itself)
                     if this.onClose then this:onClose(true) end
 
-                    -- Task D will replace this placeholder with real dialog.
-                    -- For now, surface captured text length so we can verify
-                    -- the hook works on device.
-                    local preview = (selected_text or ""):sub(1, 30)
-                    UIManager:show(InfoMessage:new{
-                        text = string.format(_("问 AI（开发中）\n选区：%d 字符\n%s…"), #(selected_text or ""), preview),
-                        timeout = 3,
-                    })
-                    logger.info("[FNS-AI] ask-ai button clicked, selected_text len=" .. tostring(selected_text and #selected_text))
+                    logger.info("[FNS-AI] ask-ai button clicked, selected_text len=" .. tostring(#selected_text))
 
-                    -- Defer clear() so the InfoMessage shows cleanly above
-                    -- the dismissed menu (qrclipboard main.lua:54-56 pattern).
+                    -- Open AI InputDialog with the captured text
+                    self:_openAiInputDialog(selected_text)
+
+                    -- Defer clear() so the InputDialog shows cleanly above
+                    -- the dismissed menu (qrclipboard pattern).
                     UIManager:scheduleIn(0.1, function()
                         if this.clear then this:clear() end
                     end)
@@ -271,6 +281,223 @@ function FnsSync:init()
         end)
         logger.info("[FNS] registered '问 AI' button in highlight menu")
     end
+end
+
+-- M8: Reset AI session state. Called on book close, ReaderUI teardown,
+-- and when user dismisses the TextViewer with "关闭".
+function FnsSync:_resetAiSession()
+    self._ai_session = nil
+end
+
+-- M8: Open the InputDialog for the user to type their question.
+-- If session is nil, starts a new session with the captured highlight as
+-- the "original text". If session exists, continues the conversation
+-- (messages already has prior Q&A pairs).
+function FnsSync:_openAiInputDialog(original_text)
+    -- Start new session if none
+    if not self._ai_session then
+        self._ai_session = {
+            original_text = original_text or "",
+            messages = {
+                { role = "system", content = self.settings.ai_system_prompt },
+                { role = "user", content = "【原文摘录】\n" .. (original_text or "") },
+            },
+        }
+    end
+
+    -- Build quick-prompt buttons row. Each button fills the input with
+    -- the corresponding template (placeholder {text} → original_text).
+    -- Only translate/explain/comment show as buttons (summarize is read
+    -- by the TextViewer's "让 AI 总结" button, not here).
+    local order = { "translate", "explain", "comment" }
+    local labels = { translate = _("翻译"), explain = _("解释"), comment = _("评论") }
+    local quick_buttons_row = {}
+    for _, key in ipairs(order) do
+        local template = self.settings.ai_quick_prompts and self.settings.ai_quick_prompts[key]
+        if template then
+            table.insert(quick_buttons_row, {
+                text = labels[key] or key,
+                callback = function()
+                    local filled = (template or ""):gsub("{text}", self._ai_session.original_text or "")
+                    if self._ai_input_dialog then
+                        self._ai_input_dialog:setInputText(filled)
+                    end
+                end,
+            })
+        end
+    end
+
+    local buttons = {
+        quick_buttons_row,
+        {
+            {
+                text = _("取消"),
+                id = "close",
+                callback = function()
+                    UIManager:close(self._ai_input_dialog)
+                    self._ai_input_dialog = nil
+                end,
+            },
+            {
+                text = _("发送"),
+                is_enter_default = true,
+                callback = function()
+                    local question = self._ai_input_dialog:getInputText() or ""
+                    if question == "" then
+                        UIManager:show(InfoMessage:new{ text = _("请输入问题"), timeout = 2 })
+                        return
+                    end
+                    table.insert(self._ai_session.messages, { role = "user", content = question })
+                    UIManager:close(self._ai_input_dialog)
+                    self._ai_input_dialog = nil
+                    self:_callAiAndShow(self._ai_session.messages)
+                end,
+            },
+        },
+    }
+
+    -- Truncate original_text to 60 chars in the description so the input
+    -- field is not pushed below the fold on Kindle's 6" screen.
+    local orig = self._ai_session.original_text or ""
+    local orig_preview = orig:sub(1, 60) .. (#orig > 60 and "…" or "")
+
+    self._ai_input_dialog = InputDialog:new{
+        title = _("问 AI"),
+        input = "",
+        input_hint = _("输入你的问题…"),
+        description = _("【原文】") .. orig_preview,
+        buttons = buttons,
+        stop_events_propagation = true,
+    }
+    UIManager:show(self._ai_input_dialog)
+    self._ai_input_dialog:onShowKeyboard()
+end
+
+-- M8: Call Ai:chat with UIManager:nextTick wrapper (same pattern as
+-- _triggerSync), then show TextViewer on success or InfoMessage on
+-- failure. Closure captures settings + session eagerly so it doesn't
+-- depend on self.ui after nextTick (close-document race).
+function FnsSync:_callAiAndShow(messages)
+    local loading = InfoMessage:new{ text = _("正在思考…"), timeout = 0 }
+    UIManager:show(loading)
+
+    -- Capture eagerly (STRONG INVARIANT: do not read self.ui inside
+    -- nextTick closure — see _triggerSync comment in this file).
+    local settings = self.settings
+    local session = self._ai_session
+
+    UIManager:nextTick(function()
+        local ok, result_or_err = pcall(function()
+            return Ai:chat(settings, messages)
+        end)
+
+        UIManager:close(loading)
+
+        if not ok then
+            logger.warn("[FNS-AI] Ai:chat pcall failed: " .. tostring(result_or_err))
+            -- M8 Task D fix (reviewer C-1): pop the user message appended
+            -- by the caller so the next attempt doesn't double-send.
+            local last = session.messages[#session.messages]
+            if last and last.role == "user" then table.remove(session.messages) end
+            UIManager:show(InfoMessage:new{
+                text = _("AI 调用内部错误，详见 crash.log（grep [FNS-AI]）"),
+                timeout = 5,
+            })
+            return
+        end
+
+        local result = result_or_err
+        if not result.ok then
+            -- M8 Task D fix (reviewer C-1): same pop as pcall-fail path.
+            local last = session.messages[#session.messages]
+            if last and last.role == "user" then table.remove(session.messages) end
+            UIManager:show(InfoMessage:new{
+                text = result.message or _("AI 调用失败"),
+                timeout = 5,
+            })
+            return
+        end
+
+        -- Append assistant reply to session
+        table.insert(session.messages, { role = "assistant", content = result.content })
+
+        self:_openAiResponseViewer()
+    end)
+end
+
+-- M8: Open TextViewer showing conversation history and action buttons.
+-- TextViewer is recreated each time (fresh dialog is simpler than reinit
+-- across keyboard transitions).
+function FnsSync:_openAiResponseViewer()
+    local session = self._ai_session
+    if not session then return end
+
+    -- Render conversation as plain-text (no emoji — Kindle e-ink).
+    local parts = {}
+    table.insert(parts, "【原文摘录】")
+    table.insert(parts, session.original_text or "")
+    table.insert(parts, "")
+    -- messages[1] is system, messages[2] is user-original-text; skip both
+    -- (original_text already shown above). Show from messages[3] onward.
+    for i = 3, #session.messages do
+        local m = session.messages[i]
+        if m.role == "user" then
+            table.insert(parts, "【问】")
+            table.insert(parts, m.content)
+        elseif m.role == "assistant" then
+            table.insert(parts, "【答】")
+            table.insert(parts, m.content)
+        end
+        table.insert(parts, "")
+    end
+
+    local buttons_table = {
+        {
+            {
+                text = _("继续问"),
+                callback = function()
+                    UIManager:close(self._ai_response_viewer)
+                    self._ai_response_viewer = nil
+                    self:_openAiInputDialog(session.original_text)
+                end,
+            },
+            {
+                text = _("让 AI 总结"),
+                callback = function()
+                    UIManager:close(self._ai_response_viewer)
+                    self._ai_response_viewer = nil
+                    local summarize_prompt = (self.settings.ai_quick_prompts and self.settings.ai_quick_prompts.summarize) or "请总结以上对话"
+                    table.insert(session.messages, { role = "user", content = summarize_prompt })
+                    self:_callAiAndShow(session.messages)
+                end,
+            },
+        },
+        {
+            {
+                text = _("关闭"),
+                callback = function()
+                    UIManager:close(self._ai_response_viewer)
+                    self._ai_response_viewer = nil
+                    self:_resetAiSession()
+                end,
+            },
+            -- "加到笔记" button will be added in Task E
+        },
+    }
+
+    self._ai_response_viewer = TextViewer:new{
+        title = _("AI 对话"),
+        text = table.concat(parts, "\n"),
+        text_type = "general",
+        add_default_buttons = true,
+        buttons_table = buttons_table,
+        close_callback = function()
+            -- If user dismisses via the default Close button (not our 关闭),
+            -- still reset session.
+            self:_resetAiSession()
+        end,
+    }
+    UIManager:show(self._ai_response_viewer)
 end
 
 function FnsSync:saveSettings()
@@ -317,20 +544,42 @@ end
 -- ===========================================================================
 
 --- Open an input dialog bound to settings[key].
--- Uses InputDialog's standard save_callback/reset_callback pattern,
--- which auto-provides |Reset|Save|Close| buttons (KOreader convention).
+-- Supports dotted nested keys (e.g. "ai_quick_prompts.translate") for M8
+-- quick-prompt templates. Top-level keys still work as before.
 function FnsSync:_editString(key, title, hint, allow_newline)
+    local function getNested(tbl, path)
+        local parts = {}
+        for p in tostring(path):gmatch("[^.]+") do table.insert(parts, p) end
+        local cur = tbl
+        for _, p in ipairs(parts) do
+            if type(cur) ~= "table" then return nil end
+            cur = cur[p]
+        end
+        return cur
+    end
+    local function setNested(tbl, path, value)
+        local parts = {}
+        for p in tostring(path):gmatch("[^.]+") do table.insert(parts, p) end
+        local cur = tbl
+        for i = 1, #parts - 1 do
+            if type(cur[parts[i]]) ~= "table" then cur[parts[i]] = {} end
+            cur = cur[parts[i]]
+        end
+        cur[parts[#parts]] = value
+    end
+
+    local current_value = getNested(self.settings, key)
     local dialog = InputDialog:new{
         title = title,
-        input = tostring(self.settings[key] or ""),
+        input = tostring(current_value or ""),
         input_hint = hint or "",
         allow_newline = allow_newline == true,
         save_callback = function(content)
-            self.settings[key] = content
+            setNested(self.settings, key, content)
             self:saveSettings()
         end,
         reset_callback = function()
-            local default = Config.DEFAULTS[key]
+            local default = getNested(Config.DEFAULTS, key)
             return default ~= nil and tostring(default) or ""
         end,
     }
@@ -1399,6 +1648,7 @@ end
 --- optionally fire an immediate sync.
 function FnsSync:onCloseDocument()
     logger.info("[FNS] event: onCloseDocument")
+    self:_resetAiSession()  -- M8 Task D fix (reviewer H-2): clear AI session on book close
     self:_cancelAutoSyncTimer()
     if not self:_gateAutoSync() then
         logger.dbg("[FNS] onCloseDocument: _gateAutoSync false")
@@ -2110,6 +2360,147 @@ function FnsSync:addToMainMenu(menu_items)
                     return false  -- TODO M6
                 end,
                 callback = function() self:onSyncAllHistory() end,
+            },
+            -- M8: AI assistant menu subtree (independent of FNS enabled)
+            {
+                text = _("AI 助手"),
+                enabled_func = function() return self.settings.ai_enabled == true end,
+                sub_item_table = {
+                    {
+                        text = _("启用 AI 对话"),
+                        checked_func = function() return self.settings.ai_enabled end,
+                        callback = function() self:_toggleBool("ai_enabled") end,
+                        separator = true,
+                    },
+                    {
+                        text = _("API 设置"),
+                        sub_item_table = {
+                            {
+                                text = _("API 服务 URL"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_api_base",
+                                        _("AI API 服务 URL"),
+                                        "https://api.deepseek.com/v1")
+                                end,
+                            },
+                            {
+                                text = _("API Key"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_api_key",
+                                        _("AI API Key"),
+                                        _("sk-...（DeepSeek 或 OpenAI 兼容服务）"))
+                                end,
+                            },
+                            {
+                                text = _("模型名"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_model",
+                                        _("AI 模型名"),
+                                        "deepseek-chat / gpt-4o-mini / 等")
+                                end,
+                            },
+                        },
+                        separator = true,
+                    },
+                    {
+                        text = _("提示词模板"),
+                        sub_item_table = {
+                            {
+                                text = _("系统提示词"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_system_prompt",
+                                        _("系统提示词（送给 AI 的角色设定）"),
+                                        _("例如：你是一个阅读助手…"),
+                                        true)
+                                end,
+                            },
+                            {
+                                text = _("翻译模板"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_quick_prompts.translate",
+                                        _("翻译快捷模板"),
+                                        _("可用 {text} 占位符"))
+                                end,
+                            },
+                            {
+                                text = _("解释模板"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_quick_prompts.explain",
+                                        _("解释快捷模板"),
+                                        _("可用 {text} 占位符"))
+                                end,
+                            },
+                            {
+                                text = _("评论模板"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_quick_prompts.comment",
+                                        _("评论快捷模板"),
+                                        _("可用 {text} 占位符"))
+                                end,
+                            },
+                            {
+                                text = _("总结模板"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_quick_prompts.summarize",
+                                        _("总结快捷模板（让 AI 总结按钮使用）"),
+                                        _("例如：请总结以上对话"))
+                                end,
+                            },
+                        },
+                        separator = true,
+                    },
+                    {
+                        text = _("高级参数"),
+                        sub_item_table = {
+                            {
+                                text = _("max_tokens"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_max_tokens",
+                                        _("max_tokens"),
+                                        "1024")
+                                end,
+                            },
+                            {
+                                text = _("temperature"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_temperature",
+                                        _("temperature"),
+                                        "0.7")
+                                end,
+                            },
+                            {
+                                text = _("超时（秒）"),
+                                keep_menu_open = true,
+                                callback = function()
+                                    self:_editString("ai_timeout_sec",
+                                        _("AI 调用超时（秒）"),
+                                        "30")
+                                end,
+                            },
+                        },
+                    },
+                    {
+                        text = _("说明"),
+                        keep_menu_open = true,
+                        callback = function()
+                            UIManager:show(InfoMessage:new{
+                                text = _("AI 助手（M8）：\n\n1. 在 API 设置里填 base URL + Key + 模型名（DeepSeek 默认）\n2. 长按高亮 → 菜单 → 问 AI\n3. 多轮对话 → 让 AI 总结 → 加到笔记（同步到 Obsidian）\n\nAPI Key 明文存在 Kindle（跟 FNS Token 同级别），不加密。Kindle 丢失请到 DeepSeek 后台撤销 Key。"),
+                                timeout = 10,
+                            })
+                        end,
+                    },
+                },
+                separator = true,
             },
             {
                 text = _("测试连接"),

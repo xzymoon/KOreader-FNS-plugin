@@ -51,6 +51,7 @@ check("DEFAULTS.ai_quick_prompts is table", type(Config.DEFAULTS.ai_quick_prompt
 check("DEFAULTS.ai_quick_prompts.translate exists", Config.DEFAULTS.ai_quick_prompts.translate ~= nil)
 check("DEFAULTS.ai_quick_prompts.explain exists", Config.DEFAULTS.ai_quick_prompts.explain ~= nil)
 check("DEFAULTS.ai_quick_prompts.comment exists", Config.DEFAULTS.ai_quick_prompts.comment ~= nil)
+check("DEFAULTS.ai_quick_prompts.summarize exists", Config.DEFAULTS.ai_quick_prompts.summarize ~= nil)
 
 -- HTTP timeout constants for AI calls
 check("Config.AI_HTTP_TIMEOUTS is table", type(Config.AI_HTTP_TIMEOUTS) == "table")

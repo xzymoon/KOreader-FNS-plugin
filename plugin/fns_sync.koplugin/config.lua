@@ -218,6 +218,7 @@ Config.DEFAULTS = {
         translate = "请把下面这段话翻译成中文：\n\n{text}",
         explain   = "请解释下面这段话的背景和含义：\n\n{text}",
         comment   = "请简要评论下面这段话的观点：\n\n{text}",
+        summarize = "请总结以上对话",  -- M8 Task D: 让 AI 总结按钮的 prompt（无 {text} 占位符）
     },
 }
 
