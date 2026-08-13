@@ -246,6 +246,37 @@ function FnsSync:init()
                        and self.settings.ai_api_key ~= ""
                 end,
                 callback = function()
+                    -- M8 Task E 决策 6（方案 A）: 自动保存高亮 + 反查 hl_ts
+                    -- 入口 A（新选区）selected_text.datetime 是 nil，调 saveHighlight
+                    -- 让 annotation 持久化并填 datetime。
+                    -- 入口 B（已有高亮）datetime 已存在，直接用。
+                    local hl_ts
+                    if this.selected_text then
+                        if not this.selected_text.datetime then
+                            -- 入口 A：触发 saveHighlight（addItem 会填 item.datetime）
+                            if this.saveHighlight then this:saveHighlight() end
+                            -- 反查 annotations 找刚保存的 item（按 pos0/pos1 匹配）
+                            if this.ui and this.ui.annotation
+                               and this.selected_text.pos0 and this.selected_text.pos1 then
+                                for _, item in ipairs(this.ui.annotation.annotations or {}) do
+                                    if item.pos0 == this.selected_text.pos0
+                                       and item.pos1 == this.selected_text.pos1 then
+                                        hl_ts = item.datetime
+                                        break
+                                    end
+                                end
+                            end
+                        else
+                            -- 入口 B
+                            hl_ts = this.selected_text.datetime
+                        end
+                    end
+                    -- Fallback：拿不到 hl_ts 用当前时间
+                    if not hl_ts then
+                        hl_ts = os.date("%Y-%m-%d %H:%M:%S")
+                        logger.warn("[FNS-AI] could not resolve hl_ts, fallback to current time: " .. hl_ts)
+                    end
+
                     -- Capture selected text eagerly — clear() may run
                     -- before our dialog opens. Pattern from qrclipboard.
                     local selected_text
@@ -266,10 +297,10 @@ function FnsSync:init()
                     -- Close the highlight menu (keep highlight itself)
                     if this.onClose then this:onClose(true) end
 
-                    logger.info("[FNS-AI] ask-ai button clicked, selected_text len=" .. tostring(#selected_text))
+                    logger.info("[FNS-AI] ask-ai button clicked, selected_text len=" .. tostring(#selected_text) .. " hl_ts=" .. tostring(hl_ts))
 
                     -- Open AI InputDialog with the captured text
-                    self:_openAiInputDialog(selected_text)
+                    self:_openAiInputDialog(selected_text, hl_ts)
 
                     -- Defer clear() so the InputDialog shows cleanly above
                     -- the dismissed menu (qrclipboard pattern).
@@ -281,6 +312,10 @@ function FnsSync:init()
         end)
         logger.info("[FNS] registered '问 AI' button in highlight menu")
     end
+
+    -- M8 Task E H-2 fix: reload any pending AI@ blocks persisted from a
+    -- prior session (e.g. crash between "加入笔记" and next sync).
+    self:_loadPendingAi()
 end
 
 -- M8: Reset AI session state. Called on book close, ReaderUI teardown,
@@ -293,11 +328,12 @@ end
 -- If session is nil, starts a new session with the captured highlight as
 -- the "original text". If session exists, continues the conversation
 -- (messages already has prior Q&A pairs).
-function FnsSync:_openAiInputDialog(original_text)
+function FnsSync:_openAiInputDialog(original_text, hl_ts)
     -- Start new session if none
     if not self._ai_session then
         self._ai_session = {
             original_text = original_text or "",
+            hl_ts = hl_ts,  -- M8 Task E: HL@ ts for AI@ block matching
             messages = {
                 { role = "system", content = self.settings.ai_system_prompt },
                 { role = "user", content = "【原文摘录】\n" .. (original_text or "") },
@@ -434,6 +470,9 @@ function FnsSync:_openAiResponseViewer()
 
     -- Render conversation as plain-text (no emoji — Kindle e-ink).
     local parts = {}
+    -- M8 Task E 决策 5 (C-2): 顶部固定提示
+    table.insert(parts, _("提示：加入笔记将写入最后一条 AI 回答，可先用【让 AI 总结】生成精炼内容。"))
+    table.insert(parts, "")
     table.insert(parts, "【原文摘录】")
     table.insert(parts, session.original_text or "")
     table.insert(parts, "")
@@ -474,6 +513,20 @@ function FnsSync:_openAiResponseViewer()
         },
         {
             {
+                text = _("加入笔记"),
+                callback = function()
+                    -- M8 Task E 决策 7: debounce 3 秒（防同秒 ts 冲突 + 防误触）
+                    local now = os.time()
+                    local last = self._last_ai_note_at or 0
+                    if now - last < 3 then
+                        UIManager:show(InfoMessage:new{ text = _("请稍候再试"), timeout = 2 })
+                        return
+                    end
+                    self._last_ai_note_at = now
+                    self:_addAiContentToNote()
+                end,
+            },
+            {
                 text = _("关闭"),
                 callback = function()
                     UIManager:close(self._ai_response_viewer)
@@ -481,7 +534,6 @@ function FnsSync:_openAiResponseViewer()
                     self:_resetAiSession()
                 end,
             },
-            -- "加到笔记" button will be added in Task E
         },
     }
 
@@ -498,6 +550,149 @@ function FnsSync:_openAiResponseViewer()
         end,
     }
     UIManager:show(self._ai_response_viewer)
+end
+
+-- M8 Task E: 把最后一条 AI 回复作为 AI@ 块写入笔记。
+-- 决策 3：取 session.messages 最后一条 assistant。
+-- 决策 4：多次加产生多个 AI@ 块（每次新 ts）。
+-- 决策 9：触发 _triggerSync，失败时沿用 M6 队列暂存。
+function FnsSync:_addAiContentToNote()
+    local session = self._ai_session
+    if not session or not session.original_text or session.original_text == "" then
+        UIManager:show(InfoMessage:new{ text = _("无 AI 内容可加入"), timeout = 2 })
+        return
+    end
+
+    -- 取最后一条 assistant
+    local last_assistant
+    for i = #session.messages, 1, -1 do
+        if session.messages[i].role == "assistant" then
+            last_assistant = session.messages[i].content
+            break
+        end
+    end
+    if not last_assistant then
+        UIManager:show(InfoMessage:new{ text = _("AI 还未回复，无内容可加入"), timeout = 2 })
+        return
+    end
+
+    -- 构造 pending AI 块
+    local book_path = self:_getCurrentBookPath()
+    local ts = os.date("%Y-%m-%d %H:%M:%S")
+    self._pending_ai_blocks = self._pending_ai_blocks or {}
+    table.insert(self._pending_ai_blocks, {
+        ts = ts,
+        hl_ts = session.hl_ts,
+        content = last_assistant,
+        model = self.settings.ai_model or "unknown",
+        book_path = book_path,  -- H-5 fix: bind to current book for drain filtering
+    })
+    self:_savePendingAi()  -- H-2 fix: persist to survive crash/restart
+
+    -- 关闭 TextViewer（不 reset session，允许用户继续问）
+    if self._ai_response_viewer then
+        UIManager:close(self._ai_response_viewer)
+        self._ai_response_viewer = nil
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = _("AI 内容已暂存，将通过下次同步写入笔记"),
+        timeout = 3,
+    })
+    logger.info(("[FNS-AI] queued AI@ block ts=%s hl_ts=%s chars=%d book=%s"):format(
+        ts, tostring(session.hl_ts), #last_assistant, tostring(book_path)))
+
+    -- H-3 fix: cancel any pending M5 debounce timer so we don't double-sync
+    -- (saveHighlight from Task C callback triggers AnnotationsModified →
+    -- M5 schedules a debounced sync; this cancel avoids a redundant POST).
+    self:_cancelAutoSyncTimer()
+
+    -- 触发同步（沿用 M5 路径；失败自动入 M6 队列）
+    self:_triggerSync({ silent = false })
+end
+
+-- M8 Task E H-2 fix: persist pending AI@ blocks to G_reader_settings so
+-- they survive crash/restart (mirrors M6 _saveQueue pattern). Without
+-- this, a KOreader crash between "加入笔记" and next sync loses the data.
+function FnsSync:_savePendingAi()
+    G_reader_settings:saveSetting("fns_sync_pending_ai", self._pending_ai_blocks or {})
+end
+
+function FnsSync:_loadPendingAi()
+    local pending = G_reader_settings:readSetting("fns_sync_pending_ai", {}) or {}
+    if #pending > 0 then
+        self._pending_ai_blocks = pending
+        logger.info(("[FNS-AI] loaded %d pending AI@ blocks from storage"):format(#pending))
+    end
+end
+
+--- M8 Task E: drain pending AI@ blocks matching book_path into segments.
+-- H-1 fix: shared by Legacy / Bidirectional / first-create paths.
+-- H-4 fix: tracks last_insert_idx per hl_ts to preserve insertion order
+--           (multiple AI@ for same HL@ appear in queue order, not reversed).
+-- H-5 fix: filters by book_path; mismatched pending kept for later sync
+--           of the original book (prevents cross-book pollution).
+-- LOW-4 fix: fallback append marks the AI@ meta with orphaned="true".
+-- @param segments table  parsed segments (modified in place)
+-- @param book_path string  current book file path
+-- @return number  drained count
+function FnsSync:_drainPendingAiBlocks(segments, book_path)
+    if not self._pending_ai_blocks or #self._pending_ai_blocks == 0 then
+        return 0
+    end
+    local drained = 0
+    local remaining = {}
+    -- H-4: last insert index per hl_ts, so subsequent AI@ for same HL@
+    -- stack AFTER prior ones (preserves queue order).
+    local last_idx_by_hl_ts = {}
+
+    for _, pending in ipairs(self._pending_ai_blocks) do
+        if pending.book_path ~= book_path then
+            -- H-5: keep for the original book's next sync
+            table.insert(remaining, pending)
+        else
+            local ai_meta = { hl = pending.hl_ts, model = pending.model }
+            local ai_seg = {
+                type = "ai",
+                ts = pending.ts,
+                content = pending.content,
+                meta = ai_meta,
+            }
+            local hl_idx = nil
+            for idx, seg in ipairs(segments) do
+                if seg.type == "hl" and seg.ts == pending.hl_ts then
+                    hl_idx = idx
+                    break
+                end
+            end
+
+            local insert_idx
+            if hl_idx then
+                local last_idx = last_idx_by_hl_ts[pending.hl_ts] or hl_idx
+                insert_idx = last_idx + 1
+            else
+                insert_idx = #segments + 1
+                ai_meta.orphaned = "true"
+                logger.warn(("[FNS-AI] no matching HL@ for AI@ ts=%s hl_ts=%s, appending at end (orphaned)"):format(
+                    pending.ts, tostring(pending.hl_ts)))
+            end
+            table.insert(segments, insert_idx, ai_seg)
+            last_idx_by_hl_ts[pending.hl_ts] = insert_idx
+            logger.info(("[FNS-AI] merging AI@ ts=%s at segment %d"):format(pending.ts, insert_idx))
+            drained = drained + 1
+        end
+    end
+
+    if #remaining > 0 then
+        self._pending_ai_blocks = remaining
+    else
+        self._pending_ai_blocks = nil
+    end
+    self:_savePendingAi()
+
+    logger.info(("[FNS-AI] drained %d AI@ blocks, %d remaining (other books)"):format(
+        drained, #remaining))
+    return drained
 end
 
 function FnsSync:saveSettings()
@@ -970,6 +1165,15 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
         local segments = Marker.parse(get_result.content)
         local actions = Marker.diff(segments, highlights_by_ts)
         local new_segments = Marker.applyDiff(segments, actions)
+
+        -- M8 Task E: drain pending AI@ blocks (decision 8).
+        -- 时机：applyDiff 之后、serialize 之前 —— 这样本地新加的 HL@ 已被
+        -- diff+applyDiff 插入到 segments，AI@ 能精确按 hl_ts 匹配。
+        -- 找不到匹配 → 末尾追加（fallback）。
+        -- H-1/H-4/H-5 fix: drain helper handles idempotent insert order,
+        -- book_path filtering, and orphaned fallback marking.
+        self:_drainPendingAiBlocks(new_segments, self:_getCurrentBookPath())
+
         local new_content = Marker.serialize(new_segments)
 
         -- Verbose-only diff trace (M6 review): useful when diagnosing
@@ -1018,6 +1222,17 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
         -- First time: render from template, createNote with createOnly=true.
         logger.info("[FNS] note does not exist, creating new")
         local new_content = Excerpt:renderFullNote(highlights_by_ts, self.settings, meta)
+
+        -- M8 Task E H-1 fix: drain pending AI@ blocks even on first-create.
+        -- Without this, AI@ blocks would sit in memory until next sync.
+        if self._pending_ai_blocks and #self._pending_ai_blocks > 0 then
+            local temp_segments = Marker.parse(new_content)
+            local drained = self:_drainPendingAiBlocks(temp_segments, self:_getCurrentBookPath())
+            if drained > 0 then
+                new_content = Marker.serialize(temp_segments)
+            end
+        end
+
         local create_result = Api:createNote(self.settings, path, new_content)
         if create_result.ok then
             if create_result.created then
@@ -1273,6 +1488,15 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
         table.insert(marker_actions, { op = "delete", ts = ts })
     end
     local new_server_segments = Marker.applyDiff(server_segments, marker_actions)
+
+    -- M8 Task E: drain pending AI@ blocks (decision 8, bidirectional path).
+    -- 时机：applyDiff 之后、serialize 之前 —— 这样本地新加的 HL@ 已被
+    -- diff+applyDiff 插入到 segments，AI@ 能精确按 hl_ts 匹配。
+    -- 找不到匹配 → 末尾追加（fallback）。
+    -- 与 _doSyncCurrentBookLegacy 的 drain 逻辑一致（共享 helper）。
+    -- H-1/H-4/H-5 fix: see _drainPendingAiBlocks.
+    self:_drainPendingAiBlocks(new_server_segments, self:_getCurrentBookPath())
+
     local new_server_content = Marker.serialize(new_server_segments)
 
     -- Step 9: extract text + validate (DEFER local mutation to Step 11).

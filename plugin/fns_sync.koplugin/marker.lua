@@ -49,6 +49,19 @@ local HL_CLOSE_SUFFIX = " -->"
 -- verbatim on round-trip but ignored by the diff logic.
 local META_KEYS = { "pos0", "pos1", "chapter" }
 
+-- M8: AI@ block markers. Same structure as HL@ (unique datetime as key,
+-- optional meta fields). Diff does NOT touch AI@ blocks — they are
+-- preserved verbatim like user content (see diff() skip logic).
+local AI_OPEN_PREFIX = "<!-- AI@"
+local AI_OPEN_SUFFIX = " -->"
+local AI_CLOSE_PREFIX = "<!-- /AI@"
+local AI_CLOSE_SUFFIX = " -->"
+
+-- Known META keys for AI@ blocks (M8). 'hl' references the parent HL@ ts;
+-- 'model' identifies the AI service used; 'orphaned' marks fallback
+-- appended blocks whose hl_ts didn't match any HL@ segment.
+local AI_META_KEYS = { "hl", "model", "orphaned" }
+
 --- Parse the body of an HL@ open marker (the part between `<!-- HL@` and ` -->`).
 -- Format: `<datetime> [key1="value1" key2="value2" ...]`
 -- datetime is always 19 chars: "YYYY-MM-DD HH:MM:SS".
@@ -107,60 +120,72 @@ local function serializeMeta(meta)
 end
 
 --- Parse notebook content into a list of segments.
--- Each segment is either:
+-- Each segment is one of:
 --   { type = "user", content = "..." }                              -- user text (verbatim)
 --   { type = "hl", ts = "...", content = "...", meta = {...}|nil }  -- KOreader highlight block
+--   { type = "ai", ts = "...", content = "...", meta = {...}|nil }  -- M8 AI assistant block
 --
--- Malformed HL@ blocks (missing close marker, missing " -->") are treated as
--- user content (preserved verbatim, not lost).
+-- Malformed HL@/AI@ blocks (missing close marker, missing " -->") are
+-- treated as user content (preserved verbatim, not lost).
 function Marker.parse(content)
     local segments = {}
     local i = 1
     local n = #content
 
     while i <= n do
-        local open_start = string.find(content, HL_OPEN_PREFIX, i, true)
-        if not open_start then
+        local hl_pos = string.find(content, HL_OPEN_PREFIX, i, true)
+        local ai_pos = string.find(content, AI_OPEN_PREFIX, i, true)
+
+        if not hl_pos and not ai_pos then
             local rest = string.sub(content, i)
             table.insert(segments, { type = "user", content = rest })
             break
         end
 
-        -- Capture text before HL@ as user content
-        if open_start > i then
-            local before = string.sub(content, i, open_start - 1)
+        local next_pos, prefix, suffix, close_prefix, close_suffix, block_type
+        if hl_pos and (not ai_pos or hl_pos < ai_pos) then
+            next_pos, prefix, suffix, close_prefix, close_suffix = hl_pos, HL_OPEN_PREFIX, HL_OPEN_SUFFIX, HL_CLOSE_PREFIX, HL_CLOSE_SUFFIX
+            block_type = "hl"
+        else
+            next_pos, prefix, suffix, close_prefix, close_suffix = ai_pos, AI_OPEN_PREFIX, AI_OPEN_SUFFIX, AI_CLOSE_PREFIX, AI_CLOSE_SUFFIX
+            block_type = "ai"
+        end
+
+        -- Capture text before HL@/AI@ as user content
+        if next_pos > i then
+            local before = string.sub(content, i, next_pos - 1)
             table.insert(segments, { type = "user", content = before })
         end
 
         -- Find the " -->" that closes the open marker
-        local open_suffix_pos = string.find(content, HL_OPEN_SUFFIX, open_start, true)
+        local open_suffix_pos = string.find(content, suffix, next_pos, true)
         if not open_suffix_pos then
-            logger.warn("[FNS] malformed HL@ open marker (no ' -->'), treating rest as user content")
-            local rest = string.sub(content, open_start)
+            logger.warn("[FNS] malformed " .. block_type .. "@ open marker (no ' -->'), treating rest as user content")
+            local rest = string.sub(content, next_pos)
             table.insert(segments, { type = "user", content = rest })
             break
         end
-        local open_body = string.sub(content, open_start + #HL_OPEN_PREFIX, open_suffix_pos - 1)
-        -- M7: parse ts + optional meta fields. ts is the first 19 chars,
+        local open_body = string.sub(content, next_pos + #prefix, open_suffix_pos - 1)
+        -- M7/M8: parse ts + optional meta fields. ts is the first 19 chars,
         -- the rest (if any) is `key="value"` META pairs. We use the ts
         -- from parseOpenMarkerMeta because the META region uses spaces as
         -- separators and XPointer values may contain "[" "]" "(" ")" "."
         -- but NOT spaces (verified from KOreader readerlink.lua samples).
         local ts, meta = Marker.parseOpenMarkerMeta(open_body)
 
-        -- Find matching close marker "<!-- /HL@<ts> -->"
-        local close_marker = HL_CLOSE_PREFIX .. ts .. HL_CLOSE_SUFFIX
-        local close_pos = string.find(content, close_marker, open_suffix_pos + #HL_OPEN_SUFFIX, true)
+        -- Find matching close marker
+        local close_marker = close_prefix .. ts .. close_suffix
+        local close_pos = string.find(content, close_marker, open_suffix_pos + #suffix, true)
         if not close_pos then
-            logger.warn("[FNS] HL@ block missing close marker for ts=" .. tostring(ts) .. ", treating as user content")
-            local rest = string.sub(content, open_start)
+            logger.warn("[FNS] " .. block_type .. "@ block missing close marker for ts=" .. tostring(ts) .. ", treating as user content")
+            local rest = string.sub(content, next_pos)
             table.insert(segments, { type = "user", content = rest })
             break
         end
 
         -- Extract block content; trim leading/trailing whitespace so diff
         -- comparisons aren't thrown off by incidental blank lines.
-        local block_start = open_suffix_pos + #HL_OPEN_SUFFIX
+        local block_start = open_suffix_pos + #suffix
         local raw_block = string.sub(content, block_start, close_pos - 1)
         -- Strip a trailing "\n> " if present — the close marker may be
         -- prefixed with "> " (see serialize comment) so it sits inside the
@@ -170,7 +195,7 @@ function Marker.parse(content)
         raw_block = raw_block:gsub("\n%s*>%s*$", "")
         local trimmed = raw_block:gsub("^%s+", ""):gsub("%s+$", "")
 
-        local seg = { type = "hl", ts = ts, content = trimmed }
+        local seg = { type = block_type, ts = ts, content = trimmed }
         if meta then seg.meta = meta end
         table.insert(segments, seg)
 
@@ -205,6 +230,35 @@ function Marker.wrapBlock(ts, content, meta)
         .. HL_CLOSE_PREFIX .. ts .. HL_CLOSE_SUFFIX
 end
 
+--- Wrap a single AI@ block. Like wrapBlock but uses AI@ markers and
+-- serializes AI_META_KEYS (hl + model). Content keeps the same \n\n
+-- trailer as wrapBlock (so blockquote rendering inside AI@ content
+-- still works in Obsidian).
+-- M8 Task E fix (reviewer CRITICAL-1): NO leading separator — inter-block
+-- separator is decided by serialize() based on previous segment type.
+-- Putting \n\n inside _wrapAiBlock broke serialize→parse→serialize
+-- idempotency (parse captured the \n\n as user content; next serialize
+-- emitted user's \n\n + another leading \n\n = non-idempotent growth).
+-- @param ts string  AI reply datetime (unique key)
+-- @param content string  AI reply text
+-- @param meta table|nil  { hl = "...", model = "..." }
+function Marker._wrapAiBlock(ts, content, meta)
+    local meta_str = ""
+    if meta then
+        local parts = {}
+        for _, key in ipairs(AI_META_KEYS) do
+            local v = meta[key]
+            if v ~= nil and v ~= "" then
+                table.insert(parts, key .. "=\"" .. tostring(v) .. "\"")
+            end
+        end
+        if #parts > 0 then meta_str = " " .. table.concat(parts, " ") end
+    end
+    return AI_OPEN_PREFIX .. ts .. meta_str .. AI_OPEN_SUFFIX .. "\n"
+        .. content .. "\n\n"
+        .. AI_CLOSE_PREFIX .. ts .. AI_CLOSE_SUFFIX
+end
+
 --- Serialize segments back to notebook content.
 -- Inverse of parse for well-formed input. Two adjacent HL@ blocks (no user
 -- text between them — e.g. after a fresh insert) get TWO blank lines as
@@ -213,16 +267,37 @@ end
 -- lines to a single paragraph break, so rendered view still shows one gap.)
 -- M7: preserves seg.meta through round-trip (writes pos0/pos1/chapter into
 -- the open marker).
+-- M8 Task E 决策 1（块间紧凑）+ CRITICAL-1 修复:
+--   HL@ → HL@ : \n\n\n (两个空行，保持原视觉)
+--   HL@ → AI@ : \n\n   (一个空行，Obsidian 段落分隔)
+--   AI@ → AI@ : \n     (紧贴堆叠，决策 4 多 AI@ 同 HL@)
+--   AI@ → HL@ : \n\n\n (两个空行，恢复视觉分隔)
+--   user → *  : 不加 (user 自带换行)
+-- 分隔符是"边界的属性"而非"块的属性"——保证 serialize→parse→serialize 幂等。
 function Marker.serialize(segments)
     local parts = {}
     for i, seg in ipairs(segments) do
         if seg.type == "user" then
             table.insert(parts, seg.content)
         elseif seg.type == "hl" then
-            if i > 1 and segments[i - 1].type == "hl" then
-                table.insert(parts, "\n\n\n")  -- two blank lines in source
+            if i > 1 then
+                local prev = segments[i - 1]
+                if prev.type == "hl" or prev.type == "ai" then
+                    table.insert(parts, "\n\n\n")
+                end
             end
             table.insert(parts, Marker.wrapBlock(seg.ts, seg.content, seg.meta))
+        elseif seg.type == "ai" then
+            if i > 1 then
+                local prev = segments[i - 1]
+                if prev.type == "hl" then
+                    table.insert(parts, "\n\n")  -- one blank line, paragraph break
+                elseif prev.type == "ai" then
+                    table.insert(parts, "\n")  -- tight stack
+                end
+                -- user → AI@: no separator (user content's own newline)
+            end
+            table.insert(parts, Marker._wrapAiBlock(seg.ts, seg.content, seg.meta))
         end
     end
     return table.concat(parts)
@@ -258,6 +333,10 @@ function Marker.diff(existing_segments, current_highlights, current_meta_map)
     end
 
     -- Deletes and updates: in existing, check against current
+    -- M8: AI segments (seg.type == "ai") are intentionally NOT iterated
+    -- here — they pass through diff unchanged (preserved verbatim like
+    -- user content). This is the core guarantee that AI@ blocks survive
+    -- M5/M6/M7 sync rounds without being mistaken for stale highlights.
     for _, seg in ipairs(existing_segments) do
         if seg.type == "hl" then
             if current_highlights[seg.ts] == nil then
