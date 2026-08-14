@@ -309,37 +309,124 @@ end)
 
 ---
 
+## 阶段九：下午 Kindle 实测（方案 Z 部署后）
+
+### 部署 + 修复验证
+
+用户重新部署方案 Z 到 Kindle，crash.log 验证：
+
+```
+13:46:01 [FNS-AI] ask-ai button clicked (方案 Z), ... hl_ts=2026-08-14 13:46:01
+                  ↑ 方案 Z 已部署生效
+
+13:47:34 [FNS-AI] hl_ts switch detected, resetting AI session:
+                  old=2026-08-14 13:46:01 new=2026-08-14 13:47:34
+                  ↑ 修复 C 切换重置工作正常
+
+13:46:04/13:47:44/13:48:07/13:48:36 [FNS-AI] drained 0 AI@ blocks
+                  ↑ 修复 B drain helper 工作正常
+```
+
+**修复 B/C/Z 全部在 Kindle 端验证生效**。
+
+### 实测进度
+
+| Phase | 状态 | 备注 |
+|-------|------|------|
+| Phase 1（M5/M6/M7 回归）| ✅ | 服务器稳定后通过 |
+| Phase 2（Task D AI 对话）| ✅ | 2.1-2.5 全过 |
+| Phase 3.A（修复 A 入口 A 不加亮）| ✅ 通过后弃用 | 方案 Y 验证通过；方案 Z 部署后行为变化（强制加亮）|
+| Phase 3.A 重测（方案 Z）| ✅ | 入口 A 自动加亮，HL@ 必存 |
+| Phase 3.B（修复 B POST 失败回滚）| ⏳ | 验证方法问题（modal 阻挡关 WiFi），待用"关路由器"方案 |
+| Phase 3.C（修复 C 切换重置）| ✅ | 通过，crash.log 确认 reset 逻辑触发 |
+| Phase 3.D（同一高亮继续问）| ⏳ | 待 Phase 3.E 网络稳定后做 |
+| Phase 3.E（入口 B hl_ts 正确）| 🟡 阻塞 | DeepSeek API wantread，AI 回复失败，无法验证 AI@ 块位置 |
+| Phase 4（边界场景）| ⏳ | 待 |
+| Phase 5（抓 crash.log）| ⏳ | 待 |
+
+### Phase 3.E 阻塞：DeepSeek API wantread
+
+#### 现象
+
+```
+13:46:07 POST /chat/completions model=deepseek-v4-flash
+13:46:17 WARN network error: wantread  ← 10 秒，正好等于 block timeout
+13:48:35 WARN network error: wantread
+13:50:27 WARN network error: wantread
+```
+
+连续 3 次问 AI 全部 wantread 失败。
+
+#### 诊断
+
+| 检查项 | 结果 |
+|--------|------|
+| DeepSeek API 配置（URL / key / model）| ✅ 正确（`api.deepseek.com` + `deepseek-v4-flash` + key 有效）|
+| DeepSeek API 服务器位置 | 🟡 DNS 解析到国内 IP（120.x/36.x，中国移动/电信）|
+| 我电脑访问 DeepSeek | ✅ 5 次全部 < 1.2s，TLS handshake 0.09s |
+| 11:42 时 Kindle 调 DeepSeek | ✅ 成功（success: 1125 chars）|
+| 13:46 起 Kindle 调 DeepSeek | ❌ wantread（10 秒 block timeout）|
+| Config.AI_HTTP_TIMEOUTS | `{10, 60}`（block 10s, total 60s）|
+
+#### 结论
+
+- **不是代码 bug**：ai.lua / api.lua 完全正常
+- **不是配置错**：URL / model / key 都对
+- **是 Kindle → DeepSeek 网络偶发不稳定**：13:46-13:50 那段时间 TLS handshake 或 read 阻塞超过 10 秒
+
+#### 可能原因（按概率）
+
+1. Kindle 网络偶发抖动（国际/国内路由变化）
+2. Kindle TLS session 失效（2 小时没用，session ticket 过期，重握手慢）
+3. DeepSeek API 对短时间多次请求 TLS 层限流
+
+#### 待用户验证
+
+- 重启 KOreader 后重试（清 TLS session 缓存）
+- 如仍失败，考虑增加 timeout（30 → 60 秒）或换备用 base URL
+
+---
+
 ## 当前分支状态
 
 - 分支：`feat/m8-ai-chat`
-- ahead：9 commits（Task A/B/C/D + E-step1）+ 本日修复（待 commit）
+- ahead：**15 commits**（含本日 4 个 commit）
 - behind：0
 - push 状态：**未 push**（按惯例等 M8 全部完成 + 实测全通过）
+
+本日 commit：
+- `9c83a34 fix(M8 Task E-step1 review): 5 个实测问题修复`
+- `c564f53 docs(progress): 2026-08-14 Task E-step1 实测问题诊断 + 修复`
+- `afe5758 fix(M8 Task E-step1): 决策 6 二次修订，方案 Y → 方案 Z`
+- `c532328 docs(progress): 2026-08-14 追加方案 Z 决策 + 服务器问题 + 实测进度`
 
 ---
 
 ## 明日计划
 
-### 用户 Kindle 实测（最终验收）
+### 完成实测（DeepSeek 网络稳定后）
 
-完整 10 步流程 + 错误/边界场景 + 关键验收点：
-- **问 AI 不卡顿**（注意：dismissablePopen 仍卡，但 saveHighlight 抖动消除）
-- **AI@ 块在 POST 失败时不再丢失**（关键修复 B）
-- **切换高亮重置对话**（方案 P）
-- **payload 日志能看到 cause**（D1 诊断）
-- M5/M6/M7 零回归
+剩余 Phase：
+- Phase 3.B（修复 B POST 失败回滚，用"关路由器"方法验证）
+- Phase 3.D（同一高亮继续问保留对话）
+- Phase 3.E（入口 B hl_ts 正确，AI@ 紧贴 HL@）— 关键验证
+- Phase 4（边界场景：飞行模式 / 连续加笔记 debounce）
+- Phase 5（抓 crash.log 复盘）
 
-### 实测后
+### 实测通过后
 
-如全通过 → commit + 考虑 push 到 master。
+- 考虑 push 到 master
+- 关闭 M8 Task E-step1
 
 ---
 
 ## 文档产出
 
-- `progress/2026-08-14 daily progress.md` — 本文档
+- `progress/2026-08-14 daily progress.md` — 本文档（含决策 6 两次修订 + 实测进度 + DeepSeek 诊断）
 - `plugin/fns_sync.koplugin/marker.lua` — `drainAiBlocks` 纯函数
-- `plugin/fns_sync.koplugin/main.lua` — 8 处修复 + 决策 6 修订
+- `plugin/fns_sync.koplugin/main.lua` — 8 处修复 + 决策 6 二次修订（方案 Z）
 - `tests/test_marker_ai.lua` — 新增 9 项测试
 - `.ua/kindle-crash-2026-08-14.log` — 昨晚 Kindle crash.log 副本（不入 git）
+- `.ua/kindle-crash-2026-08-14-after-test.log` — 上午 Phase 1 失败时 crash.log（不入 git）
+- `.ua/kindle-crash-2026-08-14-phase3.log` — 下午 Phase 3 实测 crash.log（不入 git）
 - `.ua/server-note-guoshidagang.md` / `server-note-extracted.md` — server 端 .md 拉取（不入 git）
