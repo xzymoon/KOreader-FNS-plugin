@@ -246,35 +246,25 @@ function FnsSync:init()
                        and self.settings.ai_api_key ~= ""
                 end,
                 callback = function()
-                    -- M8 Task E 决策 6（方案 A）: 自动保存高亮 + 反查 hl_ts
-                    -- 入口 A（新选区）selected_text.datetime 是 nil，调 saveHighlight
-                    -- 让 annotation 持久化并填 datetime。
-                    -- 入口 B（已有高亮）datetime 已存在，直接用。
+                    -- M8 Task E-step1 review fix: 决策 6 修订（方案 Y）。
+                    -- 实测发现自动 saveHighlight 的副作用大于价值：
+                    --   1. saveHighlight 同步阻塞（Kindle e-ink 上慢）
+                    --   2. 触发 AnnotationsModified → M5 debounce → 高亮反复
+                    --      创建删除（日志显示 48↔47 抖动循环 4 次）
+                    --   3. 无法解决用户感受到的"卡顿"（真凶是 KOreader 自身
+                    --      dismissablePopen 阻塞 io.popen，字典查询触发）
+                    -- 改为：入口 A 直接用 os.date() fallback，不调 saveHighlight，
+                    -- AI@ 块按方案 Y orphaned 追加到笔记末尾（用户已接受）。
+                    -- 入口 B（长按已有高亮）仍用 selected_text.datetime。
                     local hl_ts
-                    if this.selected_text then
-                        if not this.selected_text.datetime then
-                            -- 入口 A：触发 saveHighlight（addItem 会填 item.datetime）
-                            if this.saveHighlight then this:saveHighlight() end
-                            -- 反查 annotations 找刚保存的 item（按 pos0/pos1 匹配）
-                            if this.ui and this.ui.annotation
-                               and this.selected_text.pos0 and this.selected_text.pos1 then
-                                for _, item in ipairs(this.ui.annotation.annotations or {}) do
-                                    if item.pos0 == this.selected_text.pos0
-                                       and item.pos1 == this.selected_text.pos1 then
-                                        hl_ts = item.datetime
-                                        break
-                                    end
-                                end
-                            end
-                        else
-                            -- 入口 B
-                            hl_ts = this.selected_text.datetime
-                        end
-                    end
-                    -- Fallback：拿不到 hl_ts 用当前时间
-                    if not hl_ts then
+                    if this.selected_text and this.selected_text.datetime then
+                        -- 入口 B：已有高亮，datetime 由 KOreader addItem 填充
+                        hl_ts = this.selected_text.datetime
+                    else
+                        -- 入口 A：新选区，不自动保存高亮。hl_ts 用 os.date fallback。
+                        -- ts 唯一性由 _addAiContentToNote 的 3 秒 debounce 保证（决策 7）。
                         hl_ts = os.date("%Y-%m-%d %H:%M:%S")
-                        logger.warn("[FNS-AI] could not resolve hl_ts, fallback to current time: " .. hl_ts)
+                        logger.info("[FNS-AI] entry A (no auto saveHighlight), hl_ts=fallback " .. hl_ts)
                     end
 
                     -- Capture selected text eagerly — clear() may run
@@ -328,7 +318,17 @@ end
 -- If session is nil, starts a new session with the captured highlight as
 -- the "original text". If session exists, continues the conversation
 -- (messages already has prior Q&A pairs).
+-- E-step1 review fix (方案 P): 传入的 hl_ts 显式非 nil 且与当前 session 不同
+-- → 切换高亮 → 调 _resetAiSession 重置对话（每个高亮 = 新对话）。
+-- "继续问"按钮（_openAiResponseViewer）不传 hl_ts → nil → 不触发重置。
 function FnsSync:_openAiInputDialog(original_text, hl_ts)
+    -- 方案 P：切换高亮检测（防御日志便于实测）
+    if hl_ts ~= nil and self._ai_session and self._ai_session.hl_ts ~= hl_ts then
+        logger.info(("[FNS-AI] hl_ts switch detected, resetting AI session: old=%s new=%s"):format(
+            tostring(self._ai_session.hl_ts), tostring(hl_ts)))
+        self:_resetAiSession()
+    end
+
     -- Start new session if none
     if not self._ai_session then
         self._ai_session = {
@@ -414,15 +414,33 @@ end
 -- failure. Closure captures settings + session eagerly so it doesn't
 -- depend on self.ui after nextTick (close-document race).
 function FnsSync:_callAiAndShow(messages)
+    -- E-step1 review fix (consistency HIGH-2): guard against session==nil.
+    -- Edge case: InputDialog open while user switches book → onCloseDocument
+    -- resets session → user taps "send" → closure would crash on session.messages.
+    local session = self._ai_session
+    if not session then
+        logger.warn("[FNS-AI] _callAiAndShow: session is nil (closed mid-conversation?), aborting")
+        UIManager:show(InfoMessage:new{ text = _("会话已关闭，请重新问 AI"), timeout = 3 })
+        return
+    end
+
     local loading = InfoMessage:new{ text = _("正在思考…"), timeout = 0 }
     UIManager:show(loading)
 
     -- Capture eagerly (STRONG INVARIANT: do not read self.ui inside
     -- nextTick closure — see _triggerSync comment in this file).
     local settings = self.settings
-    local session = self._ai_session
+    -- session was already captured + nil-checked at function entry
 
     UIManager:nextTick(function()
+        -- code-reviewer LOW-1: 如果 nextTick 触发前 session 被 reset
+        -- （如用户关书触发 onCloseDocument），不要往 stale session 写。
+        if self._ai_session ~= session then
+            logger.warn("[FNS-AI] _callAiAndShow: session changed during nextTick, aborting")
+            UIManager:close(loading)
+            return
+        end
+
         local ok, result_or_err = pcall(function()
             return Ai:chat(settings, messages)
         end)
@@ -627,72 +645,64 @@ function FnsSync:_loadPendingAi()
 end
 
 --- M8 Task E: drain pending AI@ blocks matching book_path into segments.
--- H-1 fix: shared by Legacy / Bidirectional / first-create paths.
--- H-4 fix: tracks last_insert_idx per hl_ts to preserve insertion order
---           (multiple AI@ for same HL@ appear in queue order, not reversed).
--- H-5 fix: filters by book_path; mismatched pending kept for later sync
---           of the original book (prevents cross-book pollution).
+-- E-step1 review fix (CRITICAL): thin wrapper over Marker.drainAiBlocks.
+-- Previously drain cleared pending in-place BEFORE POST, so POST failure
+-- (e.g. network wantwrite) lost AI@ blocks permanently. Now drain is read-only
+-- on pending; caller commits via _commitDrainedAi only after POST success.
+-- H-4 fix: preserves enqueue order (multiple AI@ for same HL@ stack correctly).
+-- H-5 fix: filters by book_path; mismatched blocks stay in pending.
 -- LOW-4 fix: fallback append marks the AI@ meta with orphaned="true".
--- @param segments table  parsed segments (modified in place)
+-- @param segments table  parsed segments (NOT modified; new copy returned)
 -- @param book_path string  current book file path
--- @return number  drained count
+-- @return drained_list, new_segments
+--   drained_list: pending block references that were merged (caller commits)
+--   new_segments: copy of segments with AI@ blocks inserted
 function FnsSync:_drainPendingAiBlocks(segments, book_path)
-    if not self._pending_ai_blocks or #self._pending_ai_blocks == 0 then
-        return 0
-    end
-    local drained = 0
-    local remaining = {}
-    -- H-4: last insert index per hl_ts, so subsequent AI@ for same HL@
-    -- stack AFTER prior ones (preserves queue order).
-    local last_idx_by_hl_ts = {}
+    local drained, new_segments = Marker.drainAiBlocks(self._pending_ai_blocks, segments, book_path)
+    logger.info(("[FNS-AI] drained %d AI@ blocks (commit pending after POST success)"):format(#drained))
+    return drained, new_segments
+end
 
-    for _, pending in ipairs(self._pending_ai_blocks) do
-        if pending.book_path ~= book_path then
-            -- H-5: keep for the original book's next sync
-            table.insert(remaining, pending)
-        else
-            local ai_meta = { hl = pending.hl_ts, model = pending.model }
-            local ai_seg = {
-                type = "ai",
-                ts = pending.ts,
-                content = pending.content,
-                meta = ai_meta,
-            }
-            local hl_idx = nil
-            for idx, seg in ipairs(segments) do
-                if seg.type == "hl" and seg.ts == pending.hl_ts then
-                    hl_idx = idx
-                    break
-                end
-            end
+--- M8 Task E-step1 review fix: commit drained AI@ blocks (remove from pending).
+-- Called by 3 sync paths (Legacy / first-create / Bidirectional) only AFTER
+-- POST success. POST failure leaves pending untouched → blocks auto-retry
+-- on next sync.
+-- Uses (ts .. "|" .. hl_ts) as dedup key: ts uniqueness guaranteed by
+-- _addAiContentToNote's 3-second debounce (decision 7). Object-identity keys
+-- would be fragile if KOreader reloads G_reader_settings mid-flight.
+-- @param drained list  drained block references returned by _drainPendingAiBlocks
+function FnsSync:_commitDrainedAi(drained)
+    if not drained or #drained == 0 then return end
+    if not self._pending_ai_blocks or #self._pending_ai_blocks == 0 then return end
 
-            local insert_idx
-            if hl_idx then
-                local last_idx = last_idx_by_hl_ts[pending.hl_ts] or hl_idx
-                insert_idx = last_idx + 1
-            else
-                insert_idx = #segments + 1
-                ai_meta.orphaned = "true"
-                logger.warn(("[FNS-AI] no matching HL@ for AI@ ts=%s hl_ts=%s, appending at end (orphaned)"):format(
-                    pending.ts, tostring(pending.hl_ts)))
-            end
-            table.insert(segments, insert_idx, ai_seg)
-            last_idx_by_hl_ts[pending.hl_ts] = insert_idx
-            logger.info(("[FNS-AI] merging AI@ ts=%s at segment %d"):format(pending.ts, insert_idx))
-            drained = drained + 1
+    -- code-reviewer MEDIUM: 同 (ts, hl_ts) 重复理论风险（debounce 3 秒 +
+    -- 单一入口 _addAiContentToNote 实际挡住），但记录 key 命中次数以便
+    -- 实测时观察是否真有碰撞。
+    local drained_keys = {}
+    for _, d in ipairs(drained) do
+        local key = (d.ts or "") .. "|" .. (d.hl_ts or "")
+        drained_keys[key] = (drained_keys[key] or 0) + 1
+        if drained_keys[key] > 1 then
+            logger.warn(("[FNS-AI] duplicate drained key detected (ts+hl_ts collision): %s count=%d"):format(
+                key, drained_keys[key]))
         end
     end
 
-    if #remaining > 0 then
-        self._pending_ai_blocks = remaining
-    else
-        self._pending_ai_blocks = nil
+    local remaining = {}
+    for _, p in ipairs(self._pending_ai_blocks) do
+        local key = (p.ts or "") .. "|" .. (p.hl_ts or "")
+        if drained_keys[key] and drained_keys[key] > 0 then
+            drained_keys[key] = drained_keys[key] - 1
+        else
+            table.insert(remaining, p)
+        end
     end
-    self:_savePendingAi()
 
-    logger.info(("[FNS-AI] drained %d AI@ blocks, %d remaining (other books)"):format(
-        drained, #remaining))
-    return drained
+    local removed = #self._pending_ai_blocks - #remaining
+    self._pending_ai_blocks = #remaining > 0 and remaining or nil
+    self:_savePendingAi()
+    logger.info(("[FNS-AI] committed %d AI@ blocks (%d remaining across all books)"):format(
+        removed, #remaining))
 end
 
 function FnsSync:saveSettings()
@@ -1169,10 +1179,12 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
         -- M8 Task E: drain pending AI@ blocks (decision 8).
         -- 时机：applyDiff 之后、serialize 之前 —— 这样本地新加的 HL@ 已被
         -- diff+applyDiff 插入到 segments，AI@ 能精确按 hl_ts 匹配。
-        -- 找不到匹配 → 末尾追加（fallback）。
-        -- H-1/H-4/H-5 fix: drain helper handles idempotent insert order,
-        -- book_path filtering, and orphaned fallback marking.
-        self:_drainPendingAiBlocks(new_segments, self:_getCurrentBookPath())
+        -- 找不到匹配 → 末尾追加（fallback, orphaned=true）。
+        -- E-step1 review CRITICAL fix: drain is read-only on pending;
+        -- _commitDrainedAi only after POST success (POST failure auto-retries
+        -- on next sync).
+        local drained, drained_segments = self:_drainPendingAiBlocks(new_segments, self:_getCurrentBookPath())
+        new_segments = drained_segments
 
         local new_content = Marker.serialize(new_segments)
 
@@ -1198,6 +1210,8 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
         local original_ctime = get_result.note and get_result.note.ctime
         local post_result = Api:overwriteNote(self.settings, path, new_content, original_ctime)
         if post_result.ok then
+            -- E-step1 review fix: only commit drained AI@ blocks after POST success
+            self:_commitDrainedAi(drained)
             local n_ins, n_upd, n_del = 0, 0, 0
             for _, a in ipairs(actions) do
                 if a.op == "insert" then n_ins = n_ins + 1
@@ -1225,16 +1239,22 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
 
         -- M8 Task E H-1 fix: drain pending AI@ blocks even on first-create.
         -- Without this, AI@ blocks would sit in memory until next sync.
+        -- E-step1 review CRITICAL fix: drain is read-only on pending;
+        -- commit only after createNote success.
+        local drained = {}
         if self._pending_ai_blocks and #self._pending_ai_blocks > 0 then
             local temp_segments = Marker.parse(new_content)
-            local drained = self:_drainPendingAiBlocks(temp_segments, self:_getCurrentBookPath())
-            if drained > 0 then
-                new_content = Marker.serialize(temp_segments)
+            local d, new_temp = self:_drainPendingAiBlocks(temp_segments, self:_getCurrentBookPath())
+            if #d > 0 then
+                drained = d
+                new_content = Marker.serialize(new_temp)
             end
         end
 
         local create_result = Api:createNote(self.settings, path, new_content)
         if create_result.ok then
+            -- E-step1 review fix: commit drained AI@ blocks only after create success
+            self:_commitDrainedAi(drained)
             if create_result.created then
                 logger.info("[FNS] sync success: created note with " .. #annotations .. " annotations at " .. path)
                 if not silent then
@@ -1495,7 +1515,10 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
     -- 找不到匹配 → 末尾追加（fallback）。
     -- 与 _doSyncCurrentBookLegacy 的 drain 逻辑一致（共享 helper）。
     -- H-1/H-4/H-5 fix: see _drainPendingAiBlocks.
-    self:_drainPendingAiBlocks(new_server_segments, self:_getCurrentBookPath())
+    -- E-step1 review CRITICAL fix: drain is read-only on pending; commit
+    -- only after overwriteNote success (Step 10).
+    local drained, drained_server_segments = self:_drainPendingAiBlocks(new_server_segments, self:_getCurrentBookPath())
+    new_server_segments = drained_server_segments
 
     local new_server_content = Marker.serialize(new_server_segments)
 
@@ -1616,9 +1639,14 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
     local original_ctime = (get_result.note and get_result.note.ctime) or 0
     local post_result = Api:overwriteNote(self.settings, path, new_server_content, original_ctime)
     if not post_result.ok then
+        -- E-step1 review fix: POST failure must NOT commit drained AI@ blocks.
+        -- Pending stays untouched → next sync auto-retries.
         if not silent then self:_showSyncError(post_result) end
         return { ok = false, reason = "overwrite_failed", result = post_result }
     end
+
+    -- E-step1 review fix: POST success → commit drained AI@ blocks.
+    self:_commitDrainedAi(drained)
 
     -- Step 11: apply local actions (deferred from Step 9). NOW mutate local.
     -- _pull_in_flight suppresses onAnnotationsModified during the addItem
@@ -1837,7 +1865,30 @@ end
 --- varies (see readerhighlight.lua / readerbookmark.lua dispatch sites); we
 --- only use the event as a sync trigger signal, so we ignore it.
 function FnsSync:onAnnotationsModified(payload)
-    logger.info("[FNS] event: onAnnotationsModified")
+    -- E-step1 review fix (D1 diagnostic): log payload KNOWN FIELDS ONLY.
+    -- Do NOT dump the whole payload table — payload[1] is the annotation item
+    -- which contains user's highlighted text (privacy risk in crash.log).
+    -- Limited fields help diagnose the "mystery second AnnotationsModified"
+    -- issue (Kindle 实测 14:25:11 来源未明).
+    --
+    -- KOreader 已知 dispatch sites（readerbookmark/readerhighlight）:
+    --   cause="remote_pull"        本插件 Bidirectional pull（被下方显式跳过）
+    --   nb_highlights_added=±1     高亮增/删（readerbookmark:480/490）
+    --   nb_notes_added=±1          笔记增/删（readerbookmark:482/490）
+    --   index_modified=±N          修改的 annotation 索引（带符号）
+    --   modify_datetime=true       updateHighlight 边界修改（readerhighlight:2248）
+    -- 无 cause 字段表示来自 saveHighlight / editStyle / editColor 等（readerhighlight.lua）
+    local payload_info = "nil"
+    if payload then
+        local parts = {}
+        if payload.cause ~= nil then parts[#parts+1] = "cause=" .. tostring(payload.cause) end
+        if payload.nb_highlights_added ~= nil then parts[#parts+1] = "hl_added=" .. tostring(payload.nb_highlights_added) end
+        if payload.nb_notes_added ~= nil then parts[#parts+1] = "notes_added=" .. tostring(payload.nb_notes_added) end
+        if payload.index_modified ~= nil then parts[#parts+1] = "idx_mod=" .. tostring(payload.index_modified) end
+        if payload.modify_datetime ~= nil then parts[#parts+1] = "mod_dt=" .. tostring(payload.modify_datetime) end
+        payload_info = #parts > 0 and table.concat(parts, " ") or "(empty table)"
+    end
+    logger.info("[FNS] event: onAnnotationsModified payload={ " .. payload_info .. " }")
     -- M7: suppress M5 debounce during remote pull to avoid self-loop
     -- (per design v4 H-S2 fix, see progress 2026-08-06). Two suppression
     -- paths cover both phases of a pull round:

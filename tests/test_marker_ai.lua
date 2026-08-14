@@ -168,5 +168,146 @@ do
     check("idempotency: AI@→HL@ round-trip stable", out2 == out1)
 end
 
+-- 10. Orphaned AI@ meta round-trip (M8 Task E-step1 review guard)
+-- drain helper falls back to "append at end + orphaned=true" when hl_ts doesn't
+-- match any HL@ segment. The orphaned meta must round-trip through serialize→parse
+-- to survive future sync rounds.
+do
+    local segs = {
+        { type = "hl", ts = "2026-08-12 21:18:58", content = "原文" },
+        { type = "ai", ts = "2026-08-13 14:47:51", content = "AI 回答",
+          meta = { hl = "2026-08-13 14:27:20", model = "deepseek-v4-flash", orphaned = "true" } },
+    }
+    local out1 = Marker.serialize(segs)
+    local out2 = Marker.serialize(Marker.parse(out1))
+    check("orphaned: round-trip stable", out2 == out1)
+    check("orphaned: meta preserved", out2:find('orphaned="true"') ~= nil)
+end
+
+-- 11. drainAiBlocks: empty pending returns empty drained, segments unchanged
+do
+    local segs = { { type = "hl", ts = "ts1", content = "原文" } }
+    local drained, new_segs = Marker.drainAiBlocks({}, segs, "/path/book.epub")
+    check("drain: empty pending -> empty drained", #drained == 0)
+    check("drain: empty pending -> segments unchanged", #new_segs == 1)
+end
+
+-- 12. drainAiBlocks: book_path mismatch skips block (H-5 fix)
+do
+    local pending = {
+        { ts = "ai-ts1", hl_ts = "hl-ts1", content = "AI 内容",
+          model = "deepseek-chat", book_path = "/other/book.epub" },
+    }
+    local segs = { { type = "hl", ts = "hl-ts1", content = "原文" } }
+    local drained, new_segs = Marker.drainAiBlocks(pending, segs, "/this/book.epub")
+    check("drain: book_path mismatch -> drained empty", #drained == 0)
+    check("drain: book_path mismatch -> segments unchanged", #new_segs == 1)
+    check("drain: pending input NOT modified", #pending == 1)
+end
+
+-- 13. drainAiBlocks: matching HL@ found → AI@ inserted right after HL@
+do
+    local pending = {
+        { ts = "ai-ts1", hl_ts = "hl-ts1", content = "AI 内容",
+          model = "deepseek-chat", book_path = "/book.epub" },
+    }
+    local segs = {
+        { type = "hl", ts = "hl-ts1", content = "原文" },
+        { type = "user", content = "用户笔记" },
+    }
+    local drained, new_segs = Marker.drainAiBlocks(pending, segs, "/book.epub")
+    check("drain: 1 block drained", #drained == 1)
+    check("drain: 3 segments total", #new_segs == 3)
+    check("drain: AI@ inserted at position 2 (after HL@)", new_segs[2].type == "ai")
+    check("drain: AI@ has hl meta", new_segs[2].meta and new_segs[2].meta.hl == "hl-ts1")
+    check("drain: AI@ has NO orphaned meta", new_segs[2].meta.orphaned == nil)
+    check("drain: pending input NOT modified", #pending == 1)
+    check("drain: original segments NOT modified", #segs == 2)
+end
+
+-- 14. drainAiBlocks: no matching HL@ → orphaned fallback append at end
+do
+    local pending = {
+        { ts = "ai-ts1", hl_ts = "missing-hl", content = "AI 内容",
+          model = "deepseek-chat", book_path = "/book.epub" },
+    }
+    local segs = {
+        { type = "hl", ts = "hl-ts1", content = "原文" },
+    }
+    local drained, new_segs = Marker.drainAiBlocks(pending, segs, "/book.epub")
+    check("drain: orphaned drained", #drained == 1)
+    check("drain: orphaned appended at end", new_segs[2].type == "ai")
+    check("drain: orphaned has orphaned=true meta", new_segs[2].meta.orphaned == "true")
+end
+
+-- 15. drainAiBlocks: H-4 fix — multiple AI@ for same HL@ preserve enqueue order
+do
+    local pending = {
+        { ts = "ai-1", hl_ts = "hl-1", content = "AI 第一条",
+          model = "m", book_path = "/b" },
+        { ts = "ai-2", hl_ts = "hl-1", content = "AI 第二条",
+          model = "m", book_path = "/b" },
+        { ts = "ai-3", hl_ts = "hl-1", content = "AI 第三条",
+          model = "m", book_path = "/b" },
+    }
+    local segs = { { type = "hl", ts = "hl-1", content = "原文" } }
+    local drained, new_segs = Marker.drainAiBlocks(pending, segs, "/b")
+    check("drain: 3 drained in order", #drained == 3)
+    check("drain: H-4 order ai-1 first", new_segs[2].ts == "ai-1")
+    check("drain: H-4 order ai-2 second", new_segs[3].ts == "ai-2")
+    check("drain: H-4 order ai-3 third", new_segs[4].ts == "ai-3")
+end
+
+-- 16. drainAiBlocks: drain must NOT modify pending_blocks (caller manages commit)
+-- This is the CRITICAL fix: previously drain cleared pending in-place, causing
+-- AI@ blocks to be lost when POST failed. Now drain is read-only on pending.
+do
+    local pending = {
+        { ts = "ai-1", hl_ts = "hl-1", content = "AI 内容",
+          model = "m", book_path = "/b" },
+    }
+    local segs = { { type = "hl", ts = "hl-1", content = "原文" } }
+    local drained, _ = Marker.drainAiBlocks(pending, segs, "/b")
+    check("drain: caller can still commit (drained non-empty)", #drained == 1)
+    check("drain: pending still has block (NOT cleared)", #pending == 1)
+    check("drain: pending block identity preserved (caller can remove by ref/ts)",
+        pending[1].ts == "ai-1")
+end
+
+-- 17. drainAiBlocks: serialize after drain must be idempotent (regression guard)
+do
+    local pending = {
+        { ts = "ai-1", hl_ts = "hl-1", content = "AI 内容",
+          model = "m", book_path = "/b" },
+    }
+    local segs = { { type = "hl", ts = "hl-1", content = "原文" } }
+    local _, new_segs = Marker.drainAiBlocks(pending, segs, "/b")
+    local out1 = Marker.serialize(new_segs)
+    local out2 = Marker.serialize(Marker.parse(out1))
+    check("drain: serialize(parse(serialize(drained_segs))) stable", out2 == out1)
+end
+
+-- 18. drainAiBlocks: mixed book_path (2 match + 1 mismatch) — code-reviewer gap
+-- Verifies H-5 filtering + drained only contains matching blocks + mismatched
+-- ones stay in pending input (caller will re-drain on original book's sync).
+do
+    local pending = {
+        { ts = "ai-1", hl_ts = "hl-1", content = "本 book 第一条",
+          model = "m", book_path = "/this" },
+        { ts = "ai-2", hl_ts = "hl-1", content = "本 book 第二条",
+          model = "m", book_path = "/this" },
+        { ts = "ai-3", hl_ts = "hl-9", content = "其他 book",
+          model = "m", book_path = "/other" },
+    }
+    local segs = { { type = "hl", ts = "hl-1", content = "原文" } }
+    local drained, new_segs = Marker.drainAiBlocks(pending, segs, "/this")
+    check("drain mixed: 2 matching drained", #drained == 2)
+    check("drain mixed: ai-1 drained", drained[1].ts == "ai-1")
+    check("drain mixed: ai-2 drained", drained[2].ts == "ai-2")
+    check("drain mixed: 3 segments (1 HL + 2 AI)", #new_segs == 3)
+    check("drain mixed: H-4 order preserved", new_segs[2].ts == "ai-1" and new_segs[3].ts == "ai-2")
+    check("drain mixed: pending input NOT modified (3 blocks still)", #pending == 3)
+end
+
 print(("== Tests: %d passed, %d failed =="):format(tests_passed, tests_failed))
 os.exit(tests_failed == 0 and 0 or 1)

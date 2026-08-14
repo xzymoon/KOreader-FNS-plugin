@@ -423,4 +423,78 @@ function Marker.applyDiff(existing_segments, actions)
     return after_inplace
 end
 
+--- M8 Task E-step1 review fix: drain pending AI@ blocks into segments.
+-- PURE FUNCTION: does NOT modify pending_blocks or segments. Caller manages
+-- pending state via separate commit step (see FnsSync:_commitDrainedAi).
+--
+-- Why this separation: previously drain cleared pending in-place BEFORE POST,
+-- so a POST failure (e.g. network wantwrite) would lose AI@ blocks permanently.
+-- Now drain is read-only, and caller only commits after POST success.
+--
+-- H-4 fix: tracks last_insert_idx per hl_ts so multiple AI@ for the same HL@
+-- stack AFTER prior ones (preserves enqueue order).
+-- H-5 fix: filters by book_path; mismatched blocks are skipped (kept in pending
+-- for the original book's next sync, prevents cross-book pollution).
+-- LOW-4 fix: fallback append marks the AI@ meta with orphaned="true".
+--
+-- @param pending_blocks list  each item: { ts, hl_ts, content, model, book_path }
+-- @param segments list  parsed segments (NOT modified)
+-- @param book_path string  current book file path
+-- @return drained_list, new_segments
+--   drained_list: pending block references that were merged (caller commits these)
+--   new_segments: copy of segments with AI@ blocks inserted
+function Marker.drainAiBlocks(pending_blocks, segments, book_path)
+    if not pending_blocks or #pending_blocks == 0 then
+        return {}, segments
+    end
+
+    -- Copy segments so caller's table is not mutated.
+    local new_segments = {}
+    for _, s in ipairs(segments) do table.insert(new_segments, s) end
+
+    local drained = {}
+    -- H-4: last insert index per hl_ts, so subsequent AI@ for same HL@
+    -- stack AFTER prior ones (preserves queue order).
+    local last_idx_by_hl_ts = {}
+
+    for _, pending in ipairs(pending_blocks) do
+        if pending.book_path == book_path then
+            local ai_meta = { hl = pending.hl_ts, model = pending.model }
+            local ai_seg = {
+                type = "ai",
+                ts = pending.ts,
+                content = pending.content,
+                meta = ai_meta,
+            }
+
+            -- Find matching HL@ segment by hl_ts
+            local hl_idx = nil
+            for idx, seg in ipairs(new_segments) do
+                if seg.type == "hl" and seg.ts == pending.hl_ts then
+                    hl_idx = idx
+                    break
+                end
+            end
+
+            local insert_idx
+            if hl_idx then
+                local last_idx = last_idx_by_hl_ts[pending.hl_ts] or hl_idx
+                insert_idx = last_idx + 1
+            else
+                -- LOW-4 fix: no matching HL@, append at end + mark orphaned
+                insert_idx = #new_segments + 1
+                ai_meta.orphaned = "true"
+                logger.warn(("[FNS] no matching HL@ for AI@ ts=%s hl_ts=%s, appending at end (orphaned)"):format(
+                    pending.ts, tostring(pending.hl_ts)))
+            end
+            table.insert(new_segments, insert_idx, ai_seg)
+            last_idx_by_hl_ts[pending.hl_ts] = insert_idx
+            logger.info(("[FNS] merging AI@ ts=%s at segment %d"):format(pending.ts, insert_idx))
+            table.insert(drained, pending)
+        end
+    end
+
+    return drained, new_segments
+end
+
 return Marker
