@@ -246,56 +246,74 @@ function FnsSync:init()
                        and self.settings.ai_api_key ~= ""
                 end,
                 callback = function()
-                    -- M8 Task E-step1 review fix: 决策 6 修订（方案 Y）。
-                    -- 实测发现自动 saveHighlight 的副作用大于价值：
-                    --   1. saveHighlight 同步阻塞（Kindle e-ink 上慢）
-                    --   2. 触发 AnnotationsModified → M5 debounce → 高亮反复
-                    --      创建删除（日志显示 48↔47 抖动循环 4 次）
-                    --   3. 无法解决用户感受到的"卡顿"（真凶是 KOreader 自身
-                    --      dismissablePopen 阻塞 io.popen，字典查询触发）
-                    -- 改为：入口 A 直接用 os.date() fallback，不调 saveHighlight，
-                    -- AI@ 块按方案 Y orphaned 追加到笔记末尾（用户已接受）。
-                    -- 入口 B（长按已有高亮）仍用 selected_text.datetime。
-                    local hl_ts
-                    if this.selected_text and this.selected_text.datetime then
-                        -- 入口 B：已有高亮，datetime 由 KOreader addItem 填充
-                        hl_ts = this.selected_text.datetime
-                    else
-                        -- 入口 A：新选区，不自动保存高亮。hl_ts 用 os.date fallback。
-                        -- ts 唯一性由 _addAiContentToNote 的 3 秒 debounce 保证（决策 7）。
-                        hl_ts = os.date("%Y-%m-%d %H:%M:%S")
-                        logger.info("[FNS-AI] entry A (no auto saveHighlight), hl_ts=fallback " .. hl_ts)
-                    end
-
-                    -- Capture selected text eagerly — clear() may run
-                    -- before our dialog opens. Pattern from qrclipboard.
-                    local selected_text
-                    if this.selected_text and this.selected_text.text then
-                        selected_text = this.selected_text.text
-                    elseif this.selected_text and this.selected_text.pos0 and this.selected_text.pos1 then
-                        if this.ui.document and this.ui.document.getTextFromXPointers then
-                            selected_text = this.ui.document:getTextFromXPointers(
-                                this.selected_text.pos0, this.selected_text.pos1)
+                    -- M8 Task E-step1 决策 6 二次修订（方案 Y → 方案 Z）。
+                    -- 一次修订（方案 Y）：去掉 saveHighlight，hl_ts 用 os.date fallback。
+                    --   原因：误判 saveHighlight 是卡顿主因 + 担心抖动 bug。
+                    --   副作用：AI@ 块 orphaned 追加到笔记末尾，**没有 HL@ 上下文**，
+                    --   用户读笔记时困惑（"AI 在回答什么原文？"）。
+                    -- 二次修订（方案 Z）：恢复 saveHighlight（异步），让 HL@ 必存。
+                    --   - code-explorer 调研：saveHighlight 实际只做 addItem（纯内存），
+                    --     不写盘，不是卡顿主因（真凶是 dismissablePopen）。
+                    --   - 异步执行（scheduleIn(0,)）避免任何潜在阻塞。
+                    --   - clear() 不删 annotation（KOreader 源码已确认）。
+                    --   - M7 双重防护（_pull_in_flight + cause=remote_pull）确保不抖动。
+                    -- 用户代价：问 AI 后高亮强制保留（即使不想要也要手动删）。
+                    UIManager:scheduleIn(0, function()
+                        -- 1. Capture selected_text eagerly（clear 后会丢）
+                        local selected_text
+                        if this.selected_text and this.selected_text.text then
+                            selected_text = this.selected_text.text
+                        elseif this.selected_text and this.selected_text.pos0 and this.selected_text.pos1 then
+                            if this.ui.document and this.ui.document.getTextFromXPointers then
+                                selected_text = this.ui.document:getTextFromXPointers(
+                                    this.selected_text.pos0, this.selected_text.pos1)
+                            end
                         end
-                    end
 
-                    if not selected_text or selected_text == "" then
-                        UIManager:show(InfoMessage:new{ text = _("未获取到选区文本"), timeout = 2 })
-                        return
-                    end
+                        if not selected_text or selected_text == "" then
+                            UIManager:show(InfoMessage:new{ text = _("未获取到选区文本"), timeout = 2 })
+                            return
+                        end
 
-                    -- Close the highlight menu (keep highlight itself)
-                    if this.onClose then this:onClose(true) end
+                        -- 2. 解析 hl_ts（双入口）
+                        local hl_ts
+                        if this.selected_text.datetime then
+                            -- 入口 B：长按已有高亮，datetime 已存在
+                            hl_ts = this.selected_text.datetime
+                        else
+                            -- 入口 A：新选区，调 saveHighlight 持久化。
+                            -- addItem (readerannotation.lua:507) 会填 item.datetime = os.date(...)。
+                            -- saveHighlight 后 this.selected_text.datetime 仍为 nil（KOreader 不回填），
+                            -- 但反查 annotations 找刚保存的 item 可拿到 datetime。
+                            if this.saveHighlight then this:saveHighlight() end
+                            if this.ui and this.ui.annotation
+                               and this.selected_text.pos0 and this.selected_text.pos1 then
+                                for _, item in ipairs(this.ui.annotation.annotations or {}) do
+                                    if item.pos0 == this.selected_text.pos0
+                                       and item.pos1 == this.selected_text.pos1 then
+                                        hl_ts = item.datetime
+                                        break
+                                    end
+                                end
+                            end
+                        end
 
-                    logger.info("[FNS-AI] ask-ai button clicked, selected_text len=" .. tostring(#selected_text) .. " hl_ts=" .. tostring(hl_ts))
+                        -- 3. Fallback（反查失败时）
+                        if not hl_ts then
+                            hl_ts = os.date("%Y-%m-%d %H:%M:%S")
+                            logger.warn("[FNS-AI] could not resolve hl_ts after saveHighlight, fallback: " .. hl_ts)
+                        end
 
-                    -- Open AI InputDialog with the captured text
-                    self:_openAiInputDialog(selected_text, hl_ts)
+                        -- 4. 关闭 highlight menu（保留高亮）
+                        if this.onClose then this:onClose(true) end
 
-                    -- Defer clear() so the InputDialog shows cleanly above
-                    -- the dismissed menu (qrclipboard pattern).
-                    UIManager:scheduleIn(0.1, function()
+                        -- 5. 立即 clear 选区（不再延迟 0.1 秒；scheduleIn(0) 已让位给 InputDialog）
                         if this.clear then this:clear() end
+
+                        logger.info("[FNS-AI] ask-ai button clicked (方案 Z), selected_text len=" .. tostring(#selected_text) .. " hl_ts=" .. tostring(hl_ts))
+
+                        -- 6. 弹 InputDialog
+                        self:_openAiInputDialog(selected_text, hl_ts)
                     end)
                 end,
             }
