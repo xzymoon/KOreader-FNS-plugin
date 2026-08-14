@@ -176,15 +176,109 @@
 
 ## 决策记录修订
 
-### 决策 6（Task E-step1）已修订
+### 决策 6（Task E-step1）二次修订
 
-- **原决策**：方案 A（自动 saveHighlight + 反查 hl_ts）
-- **修订为**：方案 Y（不 saveHighlight + os.date fallback + 接受 orphaned 追加到笔记末尾）
-- **原因**：
-  1. saveHighlight 同步阻塞在 Kindle e-ink 上慢
+#### 原决策（方案 A，已废弃）
+
+- 自动 saveHighlight + 反查 hl_ts
+
+#### 一次修订（方案 Y，已废弃）
+
+- 不 saveHighlight + os.date fallback + 接受 orphaned 追加到笔记末尾
+- 原因（误判）：
+  1. ~~saveHighlight 同步阻塞在 Kindle e-ink 上慢~~（code-explorer 调研证伪）
   2. 触发 AnnotationsModified → M5 debounce → 高亮反复创建删除（日志显示 48↔47 抖动循环 4 次）
-  3. 无法解决用户感受到的"卡顿"（真凶是 KOreader 自身 dismissablePopen 阻塞 io.popen，字典查询触发，FNS 不能修）
-- **trade-off**：入口 A 用户没保存高亮就问 AI 时，AI@ 块按方案 Y orphaned 追加到笔记末尾（用户拍板接受）
+  3. 无法解决用户感受到的"卡顿"（真凶是 KOreader 自身 dismissablePopen，FNS 不能修）
+
+#### 二次修订（方案 Z，最终方案）
+
+- **恢复 saveHighlight（异步）+ 反查 hl_ts**
+- 触发原因：实测发现方案 Y 的副作用——AI@ 块 orphaned 追加到笔记末尾，**没有 HL@ 上下文**，用户读笔记时困惑（"AI 在回答什么原文？"）
+- 用户原话："摘录和AI块分开，并且都保留"——方案 Z 完美满足
+
+#### 方案 Z 可行性调研（code-explorer agent）
+
+| 困难 | 评估 |
+|------|------|
+| 1. saveHighlight 卡顿？| ❌ 不存在。code-explorer 调研：saveHighlight 只做 addItem（纯内存），不写盘 |
+| 2. 抖动 bug？| ⚠️ 当前代码不会重现。M7 双重防护（_pull_in_flight + cause=remote_pull）+ Legacy 路径不改本地 |
+| 3. 异步 saveHighlight？| ✅ 简单。UIManager:scheduleIn(0, ...) |
+| 4. clear() 副作用？| ✅ 无。clear 只清屏幕选区，不删 annotation |
+| 5. 改动量？| ✅ 10-15 行（仅 main.lua:248-309 入口 A callback）|
+
+#### 方案 Z 实施
+
+入口 A callback 重写为：
+```lua
+UIManager:scheduleIn(0, function()
+    -- 1. capture selected_text
+    -- 2. 入口 A: saveHighlight + 反查；入口 B: 直接用 selected_text.datetime
+    -- 3. 关闭 highlight menu（保留高亮）
+    -- 4. 立即 clear 选区（不再延迟 0.1 秒）
+    -- 5. 弹 InputDialog
+end)
+```
+
+#### 方案 Z 代价
+
+- 问 AI 后高亮**强制保留**（即使不想要也要手动删）
+- 用户已接受
+
+---
+
+## 阶段八：Kindle 实测（下午进行）
+
+### 实测前的基础设施问题
+
+#### 服务器证书更换 + 重启不稳定
+
+- 用户今早更换服务器证书（DigiCert → Encryption Everywhere DV TLS CA - G2）
+- 未重启服务 → 部分请求走新证书、部分走旧证书 → 表现极不稳定
+- 我这边 curl 测试：5 次中 2 次超时，POST 全部超时
+- 用户重启服务后仍不稳定（重启后预热期）
+- 约 10 分钟后服务器稳定：10 次 GET 全部 < 0.15s
+
+#### 排除的可能
+
+- ❌ 证书问题（浏览器 Security 显示"证书有效且可信"）
+- ❌ Kindle 网络问题（testConnection 走 HTTPS 成功）
+- ❌ Token / Vault 问题（testConnection 成功）
+- ❌ 我的代码 bug（crash.log 证明 drain helper / payload 日志 / M5 路径全正常）
+
+#### 关键证据（crash.log line 11:07 段）
+
+```
+11:07:21 onAnnotationsModified payload={ hl_added=1 idx_mod=48 }  ← 修复 D1 日志工作
+11:07:24 sync start (auto) annotations=48                          ← M5 触发
+11:07:27 GET /api/note biz_code=1 Success                          ← GET 成功
+11:07:27 inserting HL@ block ts=...11:07:21 at position 96         ← diff 正确
+11:07:27 drained 0 AI@ blocks (commit pending after POST success)  ← 修复 B 日志工作
+11:07:37 POST /api/note network error: timeout                     ← POST 服务器超时
+```
+
+修复 B/C/D1 在 crash.log 中**全部验证生效**，唯一失败是服务器 POST 端。
+
+### 实测进度
+
+| Phase | 状态 | 备注 |
+|-------|------|------|
+| Phase 1（M5/M6/M7 回归）| ✅ | 服务器稳定后通过 |
+| Phase 2（Task D AI 对话）| ✅ | 2.1-2.5 全过 |
+| Phase 3.A（修复 A 入口 A 不加亮）| ✅ | 通过（注：方案 Y 验证，方案 Z 后行为变化）|
+| Phase 3.B（修复 B POST 失败回滚）| ⏳ | 验证方法问题（modal 阻挡关 WiFi），下午用"关路由器"方案 |
+| Phase 3.C（修复 C 切换重置）| ✅ | 通过 |
+| Phase 3.D（同一高亮继续问）| ⏳ | 下午 |
+| Phase 3.E（入口 B hl_ts 正确）| ⏳ | 下午 |
+| Phase 4（边界场景）| ⏳ | 下午 |
+| Phase 5（抓 crash.log）| ⏳ | 下午 |
+
+### Phase 3 实测发现的新问题（已解决）
+
+用户实测 Phase 3 后反馈："加入笔记会出现没有原文摘录，但是有 AI 块的情况，我认为，如果没有 HL 块但是有 AI 块不合理。"
+
+→ 这是方案 Y 的副作用（入口 A 不 saveHighlight，HL@ 不存在）
+→ 用户决策改用方案 Z（恢复 saveHighlight）
+→ 本次实施
 
 ---
 
