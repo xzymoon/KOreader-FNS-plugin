@@ -2,7 +2,12 @@
 
 ## 主要任务
 
-**闪退紧急修复**：昨晚部署的方案 B（级联删除）引入 CRITICAL bug——KOReader 反复闪退。
+**M8 Task E-step1 收官日**——四件事：
+
+1. **闪退紧急修复**（e86e521）：昨晚部署的方案 B（级联删除）引入 CRITICAL bug——裸 `_` 赋值覆盖 gettext upvalue，KOReader 反复闪退
+2. **实测全过**：闪退修复 + T3'（60 秒超时）+ 方案 A（不关框+防重复）+ 方案 B（级联删除）
+3. **按钮去重**（c6e47d8）：问 AI 窗口两个"关闭"→ 删自定义按钮，保留系统默认行（白送 Find/⇱/⇲）
+4. **T7 日志复盘**（a414c7d）：证据链全绿 → **M8 Task E-step1 正式关闭**
 
 ---
 
@@ -106,6 +111,6 @@ crash.log 里另有 ai.lua:310（8-12 已回滚版本，`deepseek-v4-pro` 时代
 
 ## 分支状态
 
-- feat/m8-ai-chat，ahead 21 commits 未 push
-- 本日 commit：闪退修复（e86e521）+ 去重复关闭按钮（c6e47d8）+ 本复盘文档
+- feat/m8-ai-chat，未 push：领先本地 master 22 commits（本日 3 个：e86e521 / c6e47d8 / a414c7d）
+- ⚠️ 注意：本地 master 落后 origin/master（服务器端另有 docs 提交 df62068）——将来 push/合并时以 origin/master 为基准，届时需要先同步本地 master
 
