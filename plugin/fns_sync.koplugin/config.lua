@@ -15,7 +15,7 @@ local Config = {}
 -- changes incompatibly (e.g. a template is restructured, a field is renamed).
 -- main.lua:init checks this against the version stored in G_reader_settings
 -- and runs the corresponding migration block when an older version is found.
-Config.CURRENT_CONFIG_VERSION = 5
+Config.CURRENT_CONFIG_VERSION = 6
 
 -- Single excerpt render template (rendered once per highlight, then wrapped
 -- in an HL@ block by excerpt.lua:renderExcerptBlock).
@@ -202,8 +202,14 @@ Config.DEFAULTS = {
     ai_api_key      = "",
     ai_model        = "deepseek-chat",
     ai_system_prompt = "你是一个阅读助手，根据用户的高亮和问题给出简洁有用的回答。",
-    ai_max_tokens   = 1024,
+    -- 4096 (not 1024): reasoning models like deepseek-v4-flash spend
+    -- max_tokens on hidden reasoning before writing content; at 1024 the
+    -- budget could be exhausted by reasoning alone → content="" with
+    -- finish_reason="length" (diagnosed 2026-08-15).
+    ai_max_tokens   = 4096,
     ai_temperature  = 0.7,
+    -- 30s block timeout for the same reason: reasoning can take 10s+
+    -- before the first response byte; 10s caused spurious wantread.
     ai_timeout_sec  = 30,
 
     -- Quick prompt templates for the [翻译][解释][评论] buttons in the
@@ -221,11 +227,5 @@ Config.DEFAULTS = {
         summarize = "请总结以上对话",  -- M8 Task D: 让 AI 总结按钮的 prompt（无 {text} 占位符）
     },
 }
-
--- M8: HTTP timeouts for AI API calls (block, total). Larger than FNS's
--- LARGE_*_TIMEOUT (10/30) because DeepSeek's reasoning can take 30s.
--- Reference: kosync.koplugin uses per-scenario timeout tables too.
--- Used by ai.lua via socketutil:set_timeout(unpack(Config.AI_HTTP_TIMEOUTS)).
-Config.AI_HTTP_TIMEOUTS = { 10, 60 }
 
 return Config

@@ -159,6 +159,26 @@ function FnsSync:init()
             logger.info("[FNS] migrated settings v4→v5: AI fields backfilled from DEFAULTS")
         end
 
+        -- v5 → v6 (M8): reasoning models (deepseek-v4-flash) spend
+        -- max_tokens on hidden reasoning before writing content; at the
+        -- old default 1024 the budget could be exhausted by reasoning
+        -- alone, leaving content="" with finish_reason="length" (Kindle
+        -- log 2026-08-15 22:18-22:19, three consecutive failures). Raise
+        -- a still-default 1024 to the new default; any other user-chosen
+        -- value is kept as-is.
+        if prev_version < 6 then
+            -- tonumber: _editString may have stored the old default as
+            -- string "1024" (see MEDIUM-1 in 2026-08-15 review).
+            if tonumber(self.settings.ai_max_tokens) == 1024 then
+                self.settings.ai_max_tokens = Config.DEFAULTS.ai_max_tokens
+                logger.info("[FNS] migrated settings v5→v6: ai_max_tokens 1024 → "
+                    .. tostring(Config.DEFAULTS.ai_max_tokens) .. " (reasoning model budget)")
+            else
+                logger.info("[FNS] migrated settings v5→v6: no change needed (ai_max_tokens="
+                    .. tostring(self.settings.ai_max_tokens) .. ")")
+            end
+        end
+
         self.settings.config_version = Config.CURRENT_CONFIG_VERSION
     end
 
@@ -444,6 +464,11 @@ function FnsSync:_callAiAndShow(messages)
 
     local loading = InfoMessage:new{ text = _("正在思考…"), timeout = 0 }
     UIManager:show(loading)
+    -- code-reviewer HIGH-1: KOReader's input loop runs due nextTick tasks
+    -- BEFORE repaint, so the loading InfoMessage would never be painted —
+    -- with 30s+ reasoning calls the UI freezes with zero feedback. Paint
+    -- synchronously before handing control to the blocking Ai:chat.
+    UIManager:forceRePaint()
 
     -- Capture eagerly (STRONG INVARIANT: do not read self.ui inside
     -- nextTick closure — see _triggerSync comment in this file).
@@ -2759,7 +2784,7 @@ function FnsSync:addToMainMenu(menu_items)
                                 callback = function()
                                     self:_editString("ai_max_tokens",
                                         _("max_tokens"),
-                                        "1024")
+                                        "4096")
                                 end,
                             },
                             {

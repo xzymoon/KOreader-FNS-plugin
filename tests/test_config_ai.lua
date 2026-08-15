@@ -34,7 +34,7 @@ end
 print("== M8 AI config defaults ==")
 
 -- Schema version bumped
-check("CURRENT_CONFIG_VERSION == 5", Config.CURRENT_CONFIG_VERSION == 5)
+check("CURRENT_CONFIG_VERSION == 6", Config.CURRENT_CONFIG_VERSION == 6)
 
 -- All AI fields exist in DEFAULTS with correct defaults
 check("DEFAULTS.ai_enabled == false", Config.DEFAULTS.ai_enabled == false)
@@ -42,9 +42,9 @@ check("DEFAULTS.ai_api_base exists", Config.DEFAULTS.ai_api_base ~= nil)
 check("DEFAULTS.ai_api_key == '' (empty by default)", Config.DEFAULTS.ai_api_key == "")
 check("DEFAULTS.ai_model exists", Config.DEFAULTS.ai_model ~= nil)
 check("DEFAULTS.ai_system_prompt exists", Config.DEFAULTS.ai_system_prompt ~= nil)
-check("DEFAULTS.ai_max_tokens == 1024", Config.DEFAULTS.ai_max_tokens == 1024)
+check("DEFAULTS.ai_max_tokens == 4096 (reasoning model budget)", Config.DEFAULTS.ai_max_tokens == 4096)
 check("DEFAULTS.ai_temperature == 0.7", Config.DEFAULTS.ai_temperature == 0.7)
-check("DEFAULTS.ai_timeout_sec == 30", Config.DEFAULTS.ai_timeout_sec == 30)
+check("DEFAULTS.ai_timeout_sec == 30 (reasoning can take 10s+)", Config.DEFAULTS.ai_timeout_sec == 30)
 
 -- Quick prompt templates
 check("DEFAULTS.ai_quick_prompts is table", type(Config.DEFAULTS.ai_quick_prompts) == "table")
@@ -53,10 +53,8 @@ check("DEFAULTS.ai_quick_prompts.explain exists", Config.DEFAULTS.ai_quick_promp
 check("DEFAULTS.ai_quick_prompts.comment exists", Config.DEFAULTS.ai_quick_prompts.comment ~= nil)
 check("DEFAULTS.ai_quick_prompts.summarize exists", Config.DEFAULTS.ai_quick_prompts.summarize ~= nil)
 
--- HTTP timeout constants for AI calls
-check("Config.AI_HTTP_TIMEOUTS is table", type(Config.AI_HTTP_TIMEOUTS) == "table")
-check("Config.AI_HTTP_TIMEOUTS[1] == 10 (block)", Config.AI_HTTP_TIMEOUTS[1] == 10)
-check("Config.AI_HTTP_TIMEOUTS[2] == 60 (total)", Config.AI_HTTP_TIMEOUTS[2] == 60)
+-- (AI HTTP timeouts moved from Config.AI_HTTP_TIMEOUTS to per-user
+-- settings.ai_timeout_sec — see tests/test_ai_chat.lua for wiring tests.)
 
 print(("== Tests: %d passed, %d failed =="):format(tests_passed, tests_failed))
 os.exit(tests_failed == 0 and 0 or 1)

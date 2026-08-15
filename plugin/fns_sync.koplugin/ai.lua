@@ -20,8 +20,6 @@ local socket = require("socket")
 local socketutil = require("socketutil")
 local _ = require("gettext")
 
-local Config = require("config")
-
 local Ai = {}
 
 --- Low-level HTTP POST to {base_url}/chat/completions.
@@ -29,7 +27,8 @@ local Ai = {}
 -- endpoint with Bearer auth. No business-code envelope (OpenAI uses HTTP
 -- status only); caller parses response via rapidjson directly.
 --
--- @param settings table  plugin settings (ai_api_base, ai_api_key)
+-- @param settings table  plugin settings (ai_api_base, ai_api_key,
+--                        ai_timeout_sec)
 -- @param body table      request body table (model, messages, ...)
 -- @return http_code, body_str, status  (same convention as api.lua)
 function Ai:_rawRequest(settings, body)
@@ -61,7 +60,14 @@ function Ai:_rawRequest(settings, body)
         },
     }
 
-    socketutil:set_timeout(Config.AI_HTTP_TIMEOUTS[1], Config.AI_HTTP_TIMEOUTS[2])
+    -- Block timeout honors user's ai_timeout_sec (DEFAULTS backfills 30):
+    -- reasoning models can think 10s+ before the first response byte, so
+    -- a short block timeout surfaces as spurious "wantread" network errors
+    -- (Kindle log 2026-08-15 22:15-22:17). Total timeout = 4x block to
+    -- allow long completions.
+    local timeout_sec = tonumber(settings.ai_timeout_sec) or 30
+    if timeout_sec <= 0 then timeout_sec = 30 end  -- menu may store "0"
+    socketutil:set_timeout(timeout_sec, timeout_sec * 4)
     local code, _, status = socket.skip(1, http.request(request))
     socketutil:reset_timeout()
 
@@ -99,11 +105,13 @@ function Ai:chat(settings, messages)
         return { ok = false, message = _("AI API Key 未设置") }
     end
 
+    -- tonumber: _editString persists menu input as string ("4096"), which
+    -- would serialize into JSON as a string and break OpenAI-compatible APIs.
     local body = {
         model = settings.ai_model or "deepseek-chat",
         messages = messages,
-        max_tokens = settings.ai_max_tokens or 1024,
-        temperature = settings.ai_temperature or 0.7,
+        max_tokens = tonumber(settings.ai_max_tokens) or 4096,
+        temperature = tonumber(settings.ai_temperature) or 0.7,
         stream = false,
     }
 
@@ -168,12 +176,23 @@ function Ai:chat(settings, messages)
     end
     local content = choices[1].message and choices[1].message.content
     if not content or content == "" then
-        logger.warn("[FNS-AI] empty content in response: " .. tostring(body_str):sub(1, 200))
+        -- finish_reason="length" means max_tokens was exhausted before any
+        -- content was written — with reasoning models the hidden reasoning
+        -- spends the budget first (content="", reasoning_content="...").
+        -- Reproduced 2026-08-15; fix is raising ai_max_tokens.
+        local message
+        if choices[1].finish_reason == "length" then
+            message = _("AI 回复被截断：思考过程用尽了字数上限，请调大 AI 设置里的 max_tokens 后重试")
+        else
+            message = _("AI 回复为空")
+        end
+        logger.warn("[FNS-AI] empty content in response (finish_reason="
+            .. tostring(choices[1].finish_reason) .. "): " .. tostring(body_str):sub(1, 200))
         return {
             ok = false,
             http_code = http_code,
             raw = body_str,
-            message = _("AI 回复为空"),
+            message = message,
         }
     end
 
