@@ -115,3 +115,13 @@ crash.log 里另有 ai.lua:310（8-12 已回滚版本，`deepseek-v4-pro` 时代
 - 之前担心的"本地 master 落后 origin"核实为误判：origin 只是停在 8-5 未更新（df62068 在本地 master 历史内），快进合并无冲突
 - push 前完成 README 双语更新（98e91e3）：功能列表 +M7/M8、菜单树、AI/双向同步配置小节、隐私段补 pending_ai 与 API key 明文说明
 
+## M9 顶层方向（push 后用户提出）
+
+**三功能解耦**：FNS 同步 / 笔记 / 问 AI 相互独立——没有 FNS 服务器的用户也能用笔记和问 AI（即装即用），有服务器的用户三者叠加。动机：当前串联依赖把用户面限制在"必须自建服务器"。
+
+待拍板设计点（M9 启动时决定）：无 FNS 模式下"加入笔记"落点——(a) KOReader 高亮 note 字段（随书 metadata.lua）(b) 设备本地 markdown 文件 (c) 结合。牵涉面：isConfigured 校验、AI 会话入口、drain 本地分支。已存项目记忆 project_m9_decoupling。
+
+## 分支状态（最终）
+
+- master 已推送至 7f6f689（GitHub 同步）；本 M9 方向记录 commit 后 feat/m8-ai-chat 领先 1 个文档 commit，待下次推送
+
