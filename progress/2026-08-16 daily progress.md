@@ -51,13 +51,35 @@ new_segments, _, cascade_n_skipped = Marker.cascadeDeleteAi(...)   -- 两处
 
 crash.log 里另有 ai.lua:310（8-12 已回滚版本，`deepseek-v4-pro` 时代）和 readerhighlight.lua:1502（KOReader 自身）的旧崩溃，与现行版本无关。
 
-## 待实测
+## 上午实测反馈
 
-1. 重启 KOreader
-2. 重跑昨晚没做完的实测：T3'（60 秒超时连续追问）/ 方案 A（加入笔记不关框+防重复）/ 方案 B（删带 AI 块的高亮 → 级联删除）
-3. 特别验证：删除高亮后的同步**不再闪退**，且 Obsidian 里摘录+AI 块一起消失
+闪退修复 + T3'（60 秒超时）+ 方案 A（不关框+防重复）+ 方案 B（级联删除）**全部通过**。
+
+用户发现新问题：问 AI 窗口**两个"关闭"按钮**。
+
+### 原因
+
+自定义按钮表第二行有自己的"关闭"，而 TextViewer 设了 `add_default_buttons = true`，KOReader 默认追加一行 `[Find][⇱][⇲][Close]`（textviewer.lua:343-380）——功能重复。
+
+### 修复（方案 → 自审 → 用户确认）
+
+- 删除自定义"关闭"按钮（默认行的 Close 完全等效）
+- `close_callback` 补 `self._ai_response_viewer = nil` 防悬挂引用
+- 副产物：白送 Find（查找）/回顶部/回底部三个实用按钮
+
+### 自审（关键假设均经 KOReader 源码验证）
+
+- 默认 Close / 点窗口外（onTapClose）/ 多指滑动（onMultiSwipe）→ 都走 `TextViewer:onClose`（textviewer.lua:546-551）→ 触发 close_callback → 重置会话 ✓
+- "继续问"/"让 AI 总结"用 `UIManager:close`（只发 FlushSettings/CloseWidget 事件，不触发 close_callback）→ 会话正确保留 ✓
+- 与 A1 防重复交互：默认 Close 重置会话 → last_added_assistant 清空；重开是全新会话 ✓
+- 测试 135 项全过；语法 OK
+
+## 待办
+
+- [ ] 重新连接 Kindle 后部署 main.lua（本 commit）
+- [ ] 实测：问 AI 窗口按钮布局确认（无重复关闭 + Find/⇱/⇲ 可用）
 
 ## 分支状态
 
-- feat/m8-ai-chat，ahead 19 commits 未 push
-- 本日 commit：闪退修复（见 git log）
+- feat/m8-ai-chat，ahead 20 commits 未 push
+- 本日 commit：闪退修复（e86e521）+ 去重复关闭按钮（本 commit）

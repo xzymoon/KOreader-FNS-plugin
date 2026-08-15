@@ -603,17 +603,14 @@ function FnsSync:_openAiResponseViewer()
                     self:_addAiContentToNote()
                 end,
             },
-            {
-                text = _("关闭"),
-                callback = function()
-                    UIManager:close(self._ai_response_viewer)
-                    self._ai_response_viewer = nil
-                    self:_resetAiSession()
-                end,
-            },
         },
     }
 
+    -- 2026-08-16: 自定义"关闭"按钮已删除——与 add_default_buttons 追加的
+    -- 系统默认行（Find/⇱/⇲/Close）重复。默认 Close/点窗外/多指滑动均走
+    -- TextViewer:onClose → close_callback（下方），行为与原按钮一致；
+    -- "继续问"/"让 AI 总结"用 UIManager:close，不触发 close_callback，
+    -- 会话正确保留。
     self._ai_response_viewer = TextViewer:new{
         title = _("AI 对话"),
         text = table.concat(parts, "\n"),
@@ -621,8 +618,7 @@ function FnsSync:_openAiResponseViewer()
         add_default_buttons = true,
         buttons_table = buttons_table,
         close_callback = function()
-            -- If user dismisses via the default Close button (not our 关闭),
-            -- still reset session.
+            self._ai_response_viewer = nil
             self:_resetAiSession()
         end,
     }
