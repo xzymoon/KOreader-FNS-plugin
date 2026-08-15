@@ -60,13 +60,13 @@ function Ai:_rawRequest(settings, body)
         },
     }
 
-    -- Block timeout honors user's ai_timeout_sec (DEFAULTS backfills 30):
+    -- Block timeout honors user's ai_timeout_sec (DEFAULTS backfills 60):
     -- reasoning models can think 10s+ before the first response byte, so
     -- a short block timeout surfaces as spurious "wantread" network errors
-    -- (Kindle log 2026-08-15 22:15-22:17). Total timeout = 4x block to
-    -- allow long completions.
-    local timeout_sec = tonumber(settings.ai_timeout_sec) or 30
-    if timeout_sec <= 0 then timeout_sec = 30 end  -- menu may store "0"
+    -- (Kindle log 2026-08-15 22:15-22:17; multi-turn pushed past 30s at
+    -- 11:29-12:59). Total timeout = 4x block to allow long completions.
+    local timeout_sec = tonumber(settings.ai_timeout_sec) or 60
+    if timeout_sec <= 0 then timeout_sec = 60 end  -- menu may store "0"
     socketutil:set_timeout(timeout_sec, timeout_sec * 4)
     local code, _, status = socket.skip(1, http.request(request))
     socketutil:reset_timeout()

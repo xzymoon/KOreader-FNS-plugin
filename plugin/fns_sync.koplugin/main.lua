@@ -179,6 +179,22 @@ function FnsSync:init()
             end
         end
 
+        -- v6 → v7 (M8): multi-turn conversations (5-message context) push
+        -- DeepSeek reasoning past 30s — Kindle log 2026-08-15 11:29-12:59
+        -- shows three wantread at exactly 30s, then 3-17s successes after
+        -- retry (thinking-time variance). Raise a still-default 30 to 60;
+        -- any other user-chosen value is kept.
+        if prev_version < 7 then
+            if tonumber(self.settings.ai_timeout_sec) == 30 then
+                self.settings.ai_timeout_sec = Config.DEFAULTS.ai_timeout_sec
+                logger.info("[FNS] migrated settings v6→v7: ai_timeout_sec 30 → "
+                    .. tostring(Config.DEFAULTS.ai_timeout_sec))
+            else
+                logger.info("[FNS] migrated settings v6→v7: no change needed (ai_timeout_sec="
+                    .. tostring(self.settings.ai_timeout_sec) .. ")")
+            end
+        end
+
         self.settings.config_version = Config.CURRENT_CONFIG_VERSION
     end
 

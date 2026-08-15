@@ -15,7 +15,7 @@ local Config = {}
 -- changes incompatibly (e.g. a template is restructured, a field is renamed).
 -- main.lua:init checks this against the version stored in G_reader_settings
 -- and runs the corresponding migration block when an older version is found.
-Config.CURRENT_CONFIG_VERSION = 6
+Config.CURRENT_CONFIG_VERSION = 7
 
 -- Single excerpt render template (rendered once per highlight, then wrapped
 -- in an HL@ block by excerpt.lua:renderExcerptBlock).
@@ -208,9 +208,11 @@ Config.DEFAULTS = {
     -- finish_reason="length" (diagnosed 2026-08-15).
     ai_max_tokens   = 4096,
     ai_temperature  = 0.7,
-    -- 30s block timeout for the same reason: reasoning can take 10s+
-    -- before the first response byte; 10s caused spurious wantread.
-    ai_timeout_sec  = 30,
+    -- 60s block timeout for the same reason: reasoning can take 10s+
+    -- before the first response byte. 10s (hardcoded) and 30s both caused
+    -- spurious wantread — multi-turn context (5 messages) pushed reasoning
+    -- past 30s (Kindle log 2026-08-15 11:29-12:59, three exact-30s fails).
+    ai_timeout_sec  = 60,
 
     -- Quick prompt templates for the [翻译][解释][评论] buttons in the
     -- InputDialog. Each is prefixed to the highlighted text on send.

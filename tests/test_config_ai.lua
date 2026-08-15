@@ -34,7 +34,7 @@ end
 print("== M8 AI config defaults ==")
 
 -- Schema version bumped
-check("CURRENT_CONFIG_VERSION == 6", Config.CURRENT_CONFIG_VERSION == 6)
+check("CURRENT_CONFIG_VERSION == 7", Config.CURRENT_CONFIG_VERSION == 7)
 
 -- All AI fields exist in DEFAULTS with correct defaults
 check("DEFAULTS.ai_enabled == false", Config.DEFAULTS.ai_enabled == false)
@@ -44,7 +44,7 @@ check("DEFAULTS.ai_model exists", Config.DEFAULTS.ai_model ~= nil)
 check("DEFAULTS.ai_system_prompt exists", Config.DEFAULTS.ai_system_prompt ~= nil)
 check("DEFAULTS.ai_max_tokens == 4096 (reasoning model budget)", Config.DEFAULTS.ai_max_tokens == 4096)
 check("DEFAULTS.ai_temperature == 0.7", Config.DEFAULTS.ai_temperature == 0.7)
-check("DEFAULTS.ai_timeout_sec == 30 (reasoning can take 10s+)", Config.DEFAULTS.ai_timeout_sec == 30)
+check("DEFAULTS.ai_timeout_sec == 60 (multi-turn reasoning exceeds 30s)", Config.DEFAULTS.ai_timeout_sec == 60)
 
 -- Quick prompt templates
 check("DEFAULTS.ai_quick_prompts is table", type(Config.DEFAULTS.ai_quick_prompts) == "table")

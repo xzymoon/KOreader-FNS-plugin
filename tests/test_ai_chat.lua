@@ -141,21 +141,11 @@ print("== M8 ai.lua timeout / max_tokens / finish_reason ==")
 -- 1. Config defaults raised for reasoning models
 check("DEFAULTS.ai_max_tokens == 4096 (reasoning budget)",
     Config.DEFAULTS.ai_max_tokens == 4096)
-check("DEFAULTS.ai_timeout_sec == 30", Config.DEFAULTS.ai_timeout_sec == 30)
-check("CURRENT_CONFIG_VERSION == 6 (v5→v6 migration bumps max_tokens)",
-    Config.CURRENT_CONFIG_VERSION == 6)
+check("DEFAULTS.ai_timeout_sec == 60", Config.DEFAULTS.ai_timeout_sec == 60)
+check("CURRENT_CONFIG_VERSION == 7 (v6→v7 migration bumps ai_timeout_sec)",
+    Config.CURRENT_CONFIG_VERSION == 7)
 
 -- 2. _rawRequest honors settings.ai_timeout_sec (the 10s wantread bug)
-do
-    reset_captured()
-    local s = { ai_api_base = base_settings.ai_api_base,
-                ai_api_key = base_settings.ai_api_key,
-                ai_timeout_sec = 30 }
-    Ai:_rawRequest(s, { model = "m", messages = {} })
-    check("timeout: ai_timeout_sec=30 → set_timeout(30, 120)",
-        captured.set_timeout_args[1] == 30 and captured.set_timeout_args[2] == 120)
-end
-
 do
     reset_captured()
     local s = { ai_api_base = base_settings.ai_api_base,
@@ -169,10 +159,20 @@ end
 do
     reset_captured()
     local s = { ai_api_base = base_settings.ai_api_base,
+                ai_api_key = base_settings.ai_api_key,
+                ai_timeout_sec = 30 }
+    Ai:_rawRequest(s, { model = "m", messages = {} })
+    check("timeout: explicit ai_timeout_sec=30 still honored → set_timeout(30, 120)",
+        captured.set_timeout_args[1] == 30 and captured.set_timeout_args[2] == 120)
+end
+
+do
+    reset_captured()
+    local s = { ai_api_base = base_settings.ai_api_base,
                 ai_api_key = base_settings.ai_api_key }
     Ai:_rawRequest(s, { model = "m", messages = {} })
-    check("timeout: nil ai_timeout_sec → fallback set_timeout(30, 120)",
-        captured.set_timeout_args[1] == 30 and captured.set_timeout_args[2] == 120)
+    check("timeout: nil ai_timeout_sec → fallback set_timeout(60, 240)",
+        captured.set_timeout_args[1] == 60 and captured.set_timeout_args[2] == 240)
 end
 
 -- 3. chat: request body max_tokens
@@ -254,15 +254,15 @@ do
         captured.request_body.temperature == 0.7)
 end
 
--- 8. guard: ai_timeout_sec=0 (stored as number or string) → fallback 30
+-- 8. guard: ai_timeout_sec=0 (stored as number or string) → fallback 60
 do
     reset_captured()
     local s = { ai_api_base = base_settings.ai_api_base,
                 ai_api_key = base_settings.ai_api_key,
                 ai_timeout_sec = 0 }
     Ai:_rawRequest(s, { model = "m", messages = {} })
-    check("guard: ai_timeout_sec=0 → set_timeout(30, 120)",
-        captured.set_timeout_args[1] == 30 and captured.set_timeout_args[2] == 120)
+    check("guard: ai_timeout_sec=0 → set_timeout(60, 240)",
+        captured.set_timeout_args[1] == 60 and captured.set_timeout_args[2] == 240)
 end
 
 do
@@ -271,8 +271,8 @@ do
                 ai_api_key = base_settings.ai_api_key,
                 ai_timeout_sec = "0" }
     Ai:_rawRequest(s, { model = "m", messages = {} })
-    check("guard: ai_timeout_sec='0' → set_timeout(30, 120)",
-        captured.set_timeout_args[1] == 30 and captured.set_timeout_args[2] == 120)
+    check("guard: ai_timeout_sec='0' → set_timeout(60, 240)",
+        captured.set_timeout_args[1] == 60 and captured.set_timeout_args[2] == 240)
 end
 
 -- 9. network error path → network_error=true with status message
