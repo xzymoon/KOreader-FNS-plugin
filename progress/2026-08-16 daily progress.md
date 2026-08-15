@@ -74,12 +74,38 @@ crash.log 里另有 ai.lua:310（8-12 已回滚版本，`deepseek-v4-pro` 时代
 - 与 A1 防重复交互：默认 Close 重置会话 → last_added_assistant 清空；重开是全新会话 ✓
 - 测试 135 项全过；语法 OK
 
-## 待办
+## T7 最终日志复盘（Kindle 文件与仓库 cmp 一致，含全部修复）
 
-- [ ] 重新连接 Kindle 后部署 main.lua（本 commit）
-- [ ] 实测：问 AI 窗口按钮布局确认（无重复关闭 + Find/⇱/⇲ 可用）
+### 复查会话（最后一次启动至正常退出）
+
+| 验证项 | 日志证据 | 结果 |
+|--------|----------|------|
+| 无崩溃 | 全会话无 traceback，正常退出 `exit code: 0` | ✅ 闪退彻底解决 |
+| v7 迁移 | `migrated settings v6→v7: ai_timeout_sec 30 → 60`（两次=首会话崩溃未落盘后重跑，符合预期）| ✅ |
+| max_tokens=4096 | 所有 POST 均带 `max_tokens=4096` | ✅ |
+| AI 调用 | 多次 success（869~2119 字），含 messages=5 多轮，**零 wantread、零空回复** | ✅ |
+| 方案 A | 00:36:37 `drained 1` + `committed 1`（加入笔记），窗口保留由用户 C2c 验证 | ✅ |
+| 方案 B 级联删除 | 00:37:07 `deleting HL@ ts=...00:36:15` → `deleting AI@ ts=...00:36:37 (cascade from HL@...)` → POST 成功 `-1` | ✅ 完整证据链 |
+| 切换重置（修复 C）| `hl_ts switch detected, resetting AI session` 多次正常 | ✅ |
+| 队列路径 | onNetworkConnected → picked → queue sync success | ✅ |
+| orphaned 告警 | 会话内零条 | ✅ |
+| 按钮布局 | 设备文件 = 仓库 HEAD（cmp 一致），用户 C1 目视确认单一关闭 | ✅ |
+
+（00:24-00:25 两次 `name resolution` 失败 = WiFi 尚未连上的瞬态，符合预期。）
+
+### 结论
+
+**M8 Task E-step1 正式关闭**——Phase 1-5 实测、T0-T6、闪退修复、超时 60、方案 A（不关框+防重复）、方案 B（级联删除+B4）、按钮去重全部通过，日志复盘干净。
+
+### 遗留观察项（不阻塞）
+
+- 14:47 POST 成功但 server 无 AI@（8-14 现象）：本次会话未复现，继续观察
+- 卡顿（KOReader dismissablePopen）：用户反馈当前不卡顿，不处理
+- AI 块独立删除 UI / orphaned 清理工具：M9 范围
+- E-step2 多选 UI：M9 远期
 
 ## 分支状态
 
-- feat/m8-ai-chat，ahead 20 commits 未 push
-- 本日 commit：闪退修复（e86e521）+ 去重复关闭按钮（本 commit）
+- feat/m8-ai-chat，ahead 21 commits 未 push
+- 本日 commit：闪退修复（e86e521）+ 去重复关闭按钮（c6e47d8）+ 本复盘文档
+
