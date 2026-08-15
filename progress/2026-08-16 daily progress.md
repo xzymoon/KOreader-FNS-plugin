@@ -111,6 +111,7 @@ crash.log 里另有 ai.lua:310（8-12 已回滚版本，`deepseek-v4-pro` 时代
 
 ## 分支状态
 
-- feat/m8-ai-chat，未 push：领先本地 master 22 commits（本日 3 个：e86e521 / c6e47d8 / a414c7d）
-- ⚠️ 注意：本地 master 落后 origin/master（服务器端另有 docs 提交 df62068）——将来 push/合并时以 origin/master 为基准，届时需要先同步本地 master
+- ~~未 push~~ → **已 push（2026-08-16）**：master 快进到 98e91e3 推送成功（df62068..98e91e3，41 commits），feat/m8-ai-chat 分支同步推送
+- 之前担心的"本地 master 落后 origin"核实为误判：origin 只是停在 8-5 未更新（df62068 在本地 master 历史内），快进合并无冲突
+- push 前完成 README 双语更新（98e91e3）：功能列表 +M7/M8、菜单树、AI/双向同步配置小节、隐私段补 pending_ai 与 API key 明文说明
 
