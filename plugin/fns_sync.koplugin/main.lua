@@ -1259,8 +1259,13 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
         for _, a in ipairs(actions) do
             if a.op == "delete" then table.insert(deleted_hl_ts, a.ts) end
         end
+        -- CRITICAL fix (2026-08-16 闪退): assigning to bare `_` here CLOBBERED
+        -- the file-scope gettext upvalue `_` with a number — every later
+        -- `_("...")` call crashed KOReader (Kindle log main.lua:1166/1307).
+        -- Never assign to `_` without `local` in this file.
         local cascade_n_skipped
-        new_segments, _, cascade_n_skipped = Marker.cascadeDeleteAi(new_segments, deleted_hl_ts)
+        local _n_cascaded_ai
+        new_segments, _n_cascaded_ai, cascade_n_skipped = Marker.cascadeDeleteAi(new_segments, deleted_hl_ts)
         if cascade_n_skipped > 0 and not silent then
             UIManager:show(InfoMessage:new{
                 text = string.format(_("AI 块级联删除数量异常（%d），已拦截，请检查笔记"), cascade_n_skipped),
@@ -1607,8 +1612,11 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
     -- locally-deleted and other-device-deleted) take their AI@ blocks with
     -- them. Runs AFTER drain for the same reason as the Legacy path.
     -- B4: cascade is skipped wholesale when exceeding the safety max.
+    -- CRITICAL fix (2026-08-16 闪退): see Legacy path — bare `_` assignment
+    -- clobbered the gettext upvalue and crashed every later `_("...")` call.
     local cascade_n_skipped
-    new_server_segments, _, cascade_n_skipped = Marker.cascadeDeleteAi(new_server_segments, actions.delete_on_server)
+    local _n_cascaded_ai
+    new_server_segments, _n_cascaded_ai, cascade_n_skipped = Marker.cascadeDeleteAi(new_server_segments, actions.delete_on_server)
     if cascade_n_skipped > 0 and not silent then
         UIManager:show(InfoMessage:new{
             text = string.format(_("AI 块级联删除数量异常（%d），已拦截，请检查笔记"), cascade_n_skipped),
