@@ -103,6 +103,13 @@ Config.MAX_CHAPTER_LEN   = 256
 -- shows a one-shot toast prompting the user to re-enter the token (HIGH-I fix).
 Config.TOKEN_INVALID_CODES = { [307] = true, [308] = true }
 
+-- M8 (2026-08-15 user decision B4): cascade-delete safety net. When a sync
+-- round would cascade-delete more than this many AI@ blocks (because their
+-- host HL@ blocks were deleted), skip the cascade entirely and warn —
+-- defends against any bug misjudging deletions and mass-destroying AI
+-- answers. Normal rounds delete 1-3 blocks; 10 is far above real use.
+Config.AI_CASCADE_DELETE_MAX = 10
+
 -- All user-adjustable settings with their defaults.
 Config.DEFAULTS = {
     -- Master switch

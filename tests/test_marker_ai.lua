@@ -309,5 +309,126 @@ do
     check("drain mixed: pending input NOT modified (3 blocks still)", #pending == 3)
 end
 
+-- 19-26. cascadeDeleteAi (2026-08-15 user decision B1/B2/B4):
+-- AI@ blocks are attachments of their host HL@; when the host is deleted,
+-- its AI@ blocks go with it. B4 safety net: >AI_CASCADE_DELETE_MAX
+-- candidates in one call → skip cascade entirely (return n_skipped).
+local Config = require("config")
+
+-- 19. cascade: host deleted → its AI@ blocks removed, others untouched
+do
+    local segs = {
+        { type = "hl",  ts = "hl-2", content = "保留的摘录" },
+        { type = "ai",  ts = "ai-1", content = "被删宿主的回答 1",
+          meta = { hl = "hl-1", model = "m" } },
+        { type = "ai",  ts = "ai-2", content = "被删宿主的回答 2",
+          meta = { hl = "hl-1", model = "m" } },
+        { type = "ai",  ts = "ai-3", content = "保留宿主的回答",
+          meta = { hl = "hl-2", model = "m" } },
+        { type = "ai",  ts = "ai-4", content = "孤儿回答",
+          meta = { hl = "hl-9", model = "m" } },
+    }
+    local out, n_cascaded, n_skipped = Marker.cascadeDeleteAi(segs, { "hl-1" })
+    check("cascade: 2 blocks cascaded", n_cascaded == 2)
+    check("cascade: 0 skipped", n_skipped == 0)
+    check("cascade: 3 segments remain (1 HL + other AI + orphan AI)", #out == 3)
+    check("cascade: host HL kept", out[1].ts == "hl-2")
+    check("cascade: other-host AI kept", out[2].ts == "ai-3")
+    check("cascade: orphan AI kept (B3: not our business)", out[3].ts == "ai-4")
+    check("cascade: input not modified", #segs == 5)
+end
+
+-- 20. cascade: empty deleted list → no-op passthrough
+do
+    local segs = { { type = "hl", ts = "hl-1", content = "x" } }
+    local out, n_cascaded, n_skipped = Marker.cascadeDeleteAi(segs, {})
+    check("cascade empty: no-op, same table returned", out == segs)
+    check("cascade empty: n_cascaded == 0", n_cascaded == 0)
+end
+
+-- 21. cascade: B4 threshold — 11 candidates → skip entirely
+do
+    local segs = {}
+    for i = 1, 11 do
+        table.insert(segs, { type = "ai", ts = "ai-" .. i, content = "c" .. i,
+            meta = { hl = "hl-1", model = "m" } })
+    end
+    local out, n_cascaded, n_skipped = Marker.cascadeDeleteAi(segs, { "hl-1" })
+    check("cascade threshold: 11 candidates → skipped", n_skipped == 11)
+    check("cascade threshold: n_cascaded == 0", n_cascaded == 0)
+    check("cascade threshold: segments unchanged", #out == 11)
+end
+
+-- 22. cascade: exactly at threshold (10) → deleted
+do
+    local segs = {}
+    for i = 1, 10 do
+        table.insert(segs, { type = "ai", ts = "ai-" .. i, content = "c" .. i,
+            meta = { hl = "hl-1", model = "m" } })
+    end
+    local out, n_cascaded, n_skipped = Marker.cascadeDeleteAi(segs, { "hl-1" })
+    check("cascade at-threshold: 10 deleted", n_cascaded == 10 and n_skipped == 0)
+    check("cascade at-threshold: 0 remain", #out == 0)
+    check("cascade threshold constant == 10 (config)", Config.AI_CASCADE_DELETE_MAX == 10)
+end
+
+-- 23. cascade: AI without meta.hl untouched
+do
+    local segs = {
+        { type = "ai", ts = "ai-1", content = "无 hl 标记（异常但容忍）" },
+    }
+    local out, n_cascaded = Marker.cascadeDeleteAi(segs, { "hl-1" })
+    check("cascade no-meta: untouched", n_cascaded == 0 and #out == 1)
+end
+
+-- 24. cascade: serialize round-trip after cascade
+-- (ts values must be 19-char datetimes — parseOpenMarkerMeta hardcodes
+-- "YYYY-MM-DD HH:MM:SS" length; see marker.lua parseOpenMarkerMeta.)
+do
+    local ts1 = "2026-08-15 10:00:01"  -- deleted host
+    local ts2 = "2026-08-15 10:00:02"  -- kept host
+    local ts3 = "2026-08-15 10:00:03"  -- AI of deleted host
+    local ts4 = "2026-08-15 10:00:04"  -- AI of kept host
+    local segs = Marker.parse(
+        '<!-- HL@' .. ts2 .. ' -->\n原文\n<!-- /HL@' .. ts2 .. ' -->\n' ..
+        '<!-- AI@' .. ts3 .. ' hl="' .. ts1 .. '" model="m" -->\n回答\n<!-- /AI@' .. ts3 .. ' -->\n' ..
+        '<!-- AI@' .. ts4 .. ' hl="' .. ts2 .. '" model="m" -->\n保留\n<!-- /AI@' .. ts4 .. ' -->')
+    local out = Marker.cascadeDeleteAi(segs, { ts1 })
+    local content = Marker.serialize(out)
+    check("cascade round-trip: deleted AI gone", content:find("AI@" .. ts3, 1, true) == nil)
+    check("cascade round-trip: kept AI present", content:find("AI@" .. ts4, 1, true) ~= nil)
+    check("cascade round-trip: HL present", content:find("HL@" .. ts2, 1, true) ~= nil)
+end
+
+-- 25. cascade after drain (integration): pending AI whose host HL was just
+-- deleted must NOT come back as orphaned — cascade runs after drain.
+do
+    local pending = {
+        { ts = "ai-1", hl_ts = "hl-1", content = "宿主已删的 pending 回答",
+          model = "m", book_path = "/b" },
+    }
+    -- applyDiff already removed hl-1; segments now only hold another HL
+    local segs = { { type = "hl", ts = "hl-2", content = "别的摘录" } }
+    local _, drained_segs = Marker.drainAiBlocks(pending, segs, "/b")
+    -- drain appends ai-1 as orphaned at end; cascade must remove it
+    local out = Marker.cascadeDeleteAi(drained_segs, { "hl-1" })
+    check("drain+cascade: orphaned AI for deleted host removed", #out == 1)
+    check("drain+cascade: only the other HL remains", out[1].ts == "hl-2")
+end
+
+-- 26. cascade: mixed deleted hosts (multi-host delete round)
+do
+    local segs = {
+        { type = "hl", ts = "hl-3", content = "保留" },
+        { type = "ai", ts = "ai-1", content = "a", meta = { hl = "hl-1" } },
+        { type = "ai", ts = "ai-2", content = "b", meta = { hl = "hl-2" } },
+        { type = "ai", ts = "ai-3", content = "c", meta = { hl = "hl-3" } },
+    }
+    local out, n_cascaded = Marker.cascadeDeleteAi(segs, { "hl-1", "hl-2" })
+    check("cascade multi-host: 2 cascaded", n_cascaded == 2)
+    check("cascade multi-host: HL-3 + its AI remain", #out == 2
+        and out[1].ts == "hl-3" and out[2].ts == "ai-3")
+end
+
 print(("== Tests: %d passed, %d failed =="):format(tests_passed, tests_failed))
 os.exit(tests_failed == 0 and 0 or 1)

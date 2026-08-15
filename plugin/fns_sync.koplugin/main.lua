@@ -653,6 +653,14 @@ function FnsSync:_addAiContentToNote()
         return
     end
 
+    -- A1 防重复（2026-08-15 用户决策）：加入后不再关闭对话框，误触两次
+    -- 的概率升高；同一条 assistant 回答只允许加入一次，追问产生新回答
+    -- 后才可再次加入。_resetAiSession 重建 session 时该字段自然清空。
+    if session.last_added_assistant == last_assistant then
+        UIManager:show(InfoMessage:new{ text = _("本条回答已加入过，追问后再加入新内容"), timeout = 3 })
+        return
+    end
+
     -- 构造 pending AI 块
     local book_path = self:_getCurrentBookPath()
     local ts = os.date("%Y-%m-%d %H:%M:%S")
@@ -666,14 +674,12 @@ function FnsSync:_addAiContentToNote()
     })
     self:_savePendingAi()  -- H-2 fix: persist to survive crash/restart
 
-    -- 关闭 TextViewer（不 reset session，允许用户继续问）
-    if self._ai_response_viewer then
-        UIManager:close(self._ai_response_viewer)
-        self._ai_response_viewer = nil
-    end
+    -- 2026-08-15 用户决策：加入后保持对话窗口打开，可继续追问
+    -- （原实现关闭 TextViewer，用户必须重新长按高亮才能再问）。
+    session.last_added_assistant = last_assistant
 
     UIManager:show(InfoMessage:new{
-        text = _("AI 内容已暂存，将通过下次同步写入笔记"),
+        text = _("已加入笔记，可继续追问"),
         timeout = 3,
     })
     logger.info(("[FNS-AI] queued AI@ block ts=%s hl_ts=%s chars=%d book=%s"):format(
@@ -1245,6 +1251,23 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
         local drained, drained_segments = self:_drainPendingAiBlocks(new_segments, self:_getCurrentBookPath())
         new_segments = drained_segments
 
+        -- M8 (2026-08-15 user decision B1): cascade-delete AI@ blocks whose
+        -- host HL@ was deleted this round. Runs AFTER drain so a pending
+        -- AI@ whose host was just deleted is removed too (not re-orphaned).
+        -- B4: cascade is skipped wholesale when exceeding the safety max.
+        local deleted_hl_ts = {}
+        for _, a in ipairs(actions) do
+            if a.op == "delete" then table.insert(deleted_hl_ts, a.ts) end
+        end
+        local cascade_n_skipped
+        new_segments, _, cascade_n_skipped = Marker.cascadeDeleteAi(new_segments, deleted_hl_ts)
+        if cascade_n_skipped > 0 and not silent then
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("AI 块级联删除数量异常（%d），已拦截，请检查笔记"), cascade_n_skipped),
+                timeout = 5,
+            })
+        end
+
         local new_content = Marker.serialize(new_segments)
 
         -- Verbose-only diff trace (M6 review): useful when diagnosing
@@ -1578,6 +1601,20 @@ function FnsSync:_doSyncCurrentBookBidirectional(annotations, meta, path, silent
     -- only after overwriteNote success (Step 10).
     local drained, drained_server_segments = self:_drainPendingAiBlocks(new_server_segments, self:_getCurrentBookPath())
     new_server_segments = drained_server_segments
+
+    -- M8 (2026-08-15 user decision B2): bidirectional cascade-delete —
+    -- hosts deleted on ANY device (delete_on_server includes both
+    -- locally-deleted and other-device-deleted) take their AI@ blocks with
+    -- them. Runs AFTER drain for the same reason as the Legacy path.
+    -- B4: cascade is skipped wholesale when exceeding the safety max.
+    local cascade_n_skipped
+    new_server_segments, _, cascade_n_skipped = Marker.cascadeDeleteAi(new_server_segments, actions.delete_on_server)
+    if cascade_n_skipped > 0 and not silent then
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("AI 块级联删除数量异常（%d），已拦截，请检查笔记"), cascade_n_skipped),
+            timeout = 5,
+        })
+    end
 
     local new_server_content = Marker.serialize(new_server_segments)
 

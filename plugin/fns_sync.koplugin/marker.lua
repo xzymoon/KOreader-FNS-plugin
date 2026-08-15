@@ -35,6 +35,7 @@ Limitations:
 --]]--
 
 local logger = require("logger")
+local Config = require("config")
 
 local Marker = {}
 
@@ -495,6 +496,68 @@ function Marker.drainAiBlocks(pending_blocks, segments, book_path)
     end
 
     return drained, new_segments
+end
+
+--- M8 (2026-08-15 user decision B1/B2): cascade-delete AI@ blocks whose host
+-- HL@ block was deleted in this sync round. AI@ blocks are attachments of
+-- their host highlight — when the host goes (deleted locally, or on another
+-- device via bidirectional sync), its AI@ blocks go with it.
+--
+-- B4 safety net (user decision): if more than AI_CASCADE_DELETE_MAX blocks
+-- would be deleted in one call, skip the cascade entirely and report
+-- n_skipped — the host HL@ deletion itself is NOT affected, only the
+-- cascade is withheld (defends against mass-deletion bugs).
+--
+-- B3 (user decision): orphaned AI@ blocks (meta.hl points to a ts not in
+-- deleted_hl_ts) are NOT touched by this function.
+--
+-- PURE FUNCTION: does NOT modify the input segments.
+--
+-- Call ordering (both sync paths): after Marker.applyDiff (host HL@ already
+-- removed) AND after drainAiBlocks — so a pending AI@ whose host was just
+-- deleted gets removed instead of surviving as a fresh orphan.
+--
+-- @param segments list  segments after applyDiff + drain (NOT modified)
+-- @param deleted_hl_ts list  HL ts values deleted in this round
+-- @return new_segments, n_cascaded, n_skipped
+function Marker.cascadeDeleteAi(segments, deleted_hl_ts)
+    if not deleted_hl_ts or #deleted_hl_ts == 0 then
+        return segments, 0, 0
+    end
+
+    local deleted_set = {}
+    for _, ts in ipairs(deleted_hl_ts) do deleted_set[ts] = true end
+
+    -- Count candidates first so the B4 threshold can skip without a
+    -- partial deletion (all-or-nothing).
+    local candidates = {}
+    for idx, seg in ipairs(segments) do
+        if seg.type == "ai" and seg.meta and seg.meta.hl
+            and deleted_set[seg.meta.hl] then
+            table.insert(candidates, idx)
+        end
+    end
+    if #candidates == 0 then
+        return segments, 0, 0
+    end
+    if #candidates > Config.AI_CASCADE_DELETE_MAX then
+        logger.warn(("[FNS] cascade-delete skipped: %d AI@ blocks exceed safety max %d — keeping AI@ blocks, investigate diff"):format(
+            #candidates, Config.AI_CASCADE_DELETE_MAX))
+        return segments, 0, #candidates
+    end
+
+    local drop = {}
+    for _, idx in ipairs(candidates) do drop[idx] = true end
+    local out = {}
+    for idx, seg in ipairs(segments) do
+        if drop[idx] then
+            logger.info(("[FNS] deleting AI@ block ts=%s (cascade from HL@%s)"):format(
+                tostring(seg.ts), tostring(seg.meta.hl)))
+        else
+            table.insert(out, seg)
+        end
+    end
+    return out, #candidates, 0
 end
 
 return Marker

@@ -121,9 +121,63 @@ Verdict: WARNING（核心修复正确可提交，1 HIGH 建议带上）
 - 测试：config_ai 14 + ai_chat 23（显式 30 仍被尊重的用例保留）+ marker 56 + threeway 19 = 112 全过
 - 已部署 Kindle（重启 KOreader 后生效）
 
-## 用户提出的新需求（下一轮）
+## 阶段六：两个新功能（用户决策 A1/B1/B2/B4 后实施）
 
-1. **删除高亮应级联删除其附属 AI 块**——现状 AI@ 残留成孤儿（详见方案 B）
-2. **"加入笔记"后对话框不应关闭**——应可继续追问（详见方案 A）
+### 方案 A：加入笔记不关对话框 + 防重复（A1）
+
+- `_addAiContentToNote` 不再关闭 TextViewer（原注释"允许继续问"名不副实——窗口都没了）
+- 防重复：`session.last_added_assistant` 按内容比较，同一回答只加一次；追问新回答自然放行；`_resetAiSession` 整表重建时字段自然清空
+- 提示改为"已加入笔记，可继续追问"
+
+### 方案 B：级联删除 AI@ 块（B1/B2/B4，B3 不做）
+
+- `marker.lua` 新增纯函数 `Marker.cascadeDeleteAi(segments, deleted_hl_ts)`：宿主 HL@ 被删 → 其名下 AI@ 一并删；孤儿 AI@ 不碰（B3）；先计数后删除保证 all-or-nothing
+- B4 安全网：`Config.AI_CASCADE_DELETE_MAX = 10`，单轮级联超 10 块 → 整体跳过 + warn 日志 + 非 silent 模式 InfoMessage；宿主 HL@ 删除本身不受影响
+- 两路径接入（顺序：applyDiff → drain → cascade → serialize）：
+  - Legacy（main.lua `_doSyncCurrentBookLegacy`）：deleted_hl_ts 从 `Marker.diff` 的 delete actions 收集
+  - Bidirectional（main.lua `_doSyncCurrentBookBidirectional`）：直接传 `actions.delete_on_server`（B2：他机删除也级联）
+- cascade 放在 drain 之后：pending AI@ 的宿主本轮被删 → 该块也被移除，不会"复活成新孤儿"（测试 #25 钦定语义）
+
+### 审查结论（code-reviewer）：APPROVE，0 CRITICAL / 0 HIGH
+
+3 个 MEDIUM 为决策后果知悉项（非 bug），记录如下：
+
+| # | 知悉项 | 说明 |
+|---|--------|------|
+| M1 | B4 拦截是**永久性**的 | 拦截轮宿主 HL@ 照删并 POST；下轮 diff 里这些 ts 已消失，cascade 永不再针对它们运行。被保留的 AI@ 成为永久孤儿（B3 又无清理工具），需手动删。正常触发场景：一次删除一整章十几条带 AI 回答的高亮 |
+| M2 | 窄场景数据丢失（B1 决策后果） | 加入笔记 → 首次同步失败（离线）→ 用户删除高亮 → 下次同步成功：该回答从未在笔记出现即被静默清除。本机删除与他机删除结局不对称（他机删除场景回答以 orphaned 保留） |
+| M3 | 队列路径（silent）B4 警告只在 crash.log | M6 队列触发 B4 时不弹窗，按项目"实测看 crash.log"工作流可接受 |
+
+LOW×3：debounce 时间戳在去重拒绝时也被消耗（3 秒内追问后加入新回答会被"请稍候再试"拦一次）；内容字符串比较的碰撞（两问同答案，第二问不能加入——A1 已知取舍）；B4 警告在 POST 前弹出（时序无害）。
+
+### 测试
+
+- tests/test_marker_ai.lua 新增 #19-26（8 组 23 项断言）：基本级联 / 空列表 / 阈值上下界 / 无 meta 容忍 / 序列化往返 / drain 后级联 / 多宿主
+- 中途踩坑：测试 ts 用了 "ai-1" 短字符串，`parseOpenMarkerMeta` 硬编码 19 字符 datetime——测试改用真实格式后通过
+- **135 项全过**：config 14 + ai_chat 23 + marker_ai 79 + threeway 19
+
+### 改动文件
+
+| 文件 | 改动 |
+|------|------|
+| `plugin/fns_sync.koplugin/main.lua` | 方案 A（去关框 + 防重复）+ 方案 B 两路径级联接入 + B4 警告 |
+| `plugin/fns_sync.koplugin/marker.lua` | `cascadeDeleteAi` 纯函数（约 55 行）+ require config |
+| `plugin/fns_sync.koplugin/config.lua` | `AI_CASCADE_DELETE_MAX = 10` |
+| `tests/test_marker_ai.lua` | #19-26 新测试 |
+
+已部署 Kindle（main/marker/config 三文件 cmp 校验一致），重启 KOreader 生效。
+
+## 待实测（重启 KOreader 后）
+
+1. **T3 复测**（超时 60 生效后）：同一段文字连续追问两次，预期不再 30 秒 wantread；日志确认 `migrated settings v6→v7: ai_timeout_sec 30 → 60`
+2. **方案 A**：问 AI → 加入笔记 → 对话框仍在 → 继续问新问题 → 再加入（新回答可加）；同回答重复点加入 → 提示"已加入过"
+3. **方案 B**：删一条带 AI 块的高亮 → 等自动同步 → Obsidian 里摘录和 AI 块一起消失；crash.log 应有 `deleting AI@ ... (cascade from HL@...)`
+4. B4 阈值场景不易实测（需 >10 块），靠单测保证
+
+## 分支状态
+
+- 分支：`feat/m8-ai-chat`，ahead 18 commits 未 push（按惯例等实测全过后）
+- 本日 commit：`235c140`（超时+max_tokens 根因修复）、`bdd14ee`（超时 60）、本文件随第三个 commit（方案 A+B）
+
 
 
