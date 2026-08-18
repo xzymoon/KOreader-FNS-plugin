@@ -9,7 +9,7 @@ Sync highlights and notes from KOreader to Obsidian via the [Fast Note Sync](htt
 - ✨ **Auto-sync** (triggered on highlight/note edits and book close, debounced to merge consecutive operations)
 - 📦 **Offline queue** (queued while offline, auto-pushed once reconnected; retry + freeze-on-failure)
 - 🔄 **Bidirectional cross-device sync** (three-way merge: deleting an HL@ block in Obsidian deletes the highlight across devices; highlights created on other devices are pulled back automatically)
-- 🤖 **AI reading assistant** (long-press "Ask AI" on selected text; chat via DeepSeek or any OpenAI-compatible API; add AI answers to your note right under the excerpt — cascade-deleted along with it)
+- 🤖 **AI reading assistant** (long-press "Ask AI" on selected text; chat via DeepSeek or any OpenAI-compatible API; add the Q&A pair to your note right under the excerpt — cascade-deleted along with it)
 - 📝 **Item-level HL@ marker** (your interleaved edits in Obsidian are preserved)
 - 🎨 **Customizable templates** (excerpt / note / filename templates, color emoji, AI quick-prompt templates)
 - 📚 **Cross-device sync per book** (each book can override title / author — useful for anthologies)
@@ -120,7 +120,7 @@ Once enabled, highlight/note edits and book close will trigger auto-sync (5-seco
    - **Model name** (e.g. `deepseek-chat`; note that reasoning models spend max_tokens on hidden thinking first — pair them with a larger max_tokens)
 3. Check **Enable AI Chat**
 
-Usage: select text while reading → long-press **Ask AI** → type a question (or tap a quick button: translate/explain/comment) → in the answer window you can keep asking, ask for a summary, or **Add to Note** (the AI answer is written into your note right under that excerpt; deleting the excerpt cascade-deletes the answer).
+Usage: select text while reading → long-press **Ask AI** → type a question (or tap a quick button: translate/explain/comment) → in the answer window you can keep asking, ask for a summary, or **Add to Note** (the question and answer are written into your note as a pair right under that excerpt; quick prompts are recorded as a short label, and any pasted original text is stripped from hand-typed questions; deleting the excerpt cascade-deletes the answer).
 
 ### Bidirectional Sync (optional, experimental)
 
