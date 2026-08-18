@@ -1,5 +1,37 @@
 # 2026-08-18 daily progress
 
+# 2026-08-18 daily progress
+
+## 实测复盘：20:22 首次实测失败 —— Kindle 网络故障（非代码问题）
+
+用户 Kindle 实测报"AI 回复解析失败"+"笔记不自动同步 Obsidian"。crash.log
+（/h/koreader/crash.log）诊断结论：
+
+**三个错误全是网络层，与本次代码改动无关**（新代码路径当天未执行到——
+AI 调用在网络层就失败了，日志中无 `queued AI@ block (Q+A merged)`）：
+
+| 时间 | 错误 | 层级 |
+|------|------|------|
+| 20:22:51 | `temporary failure in name resolution` | DNS 解析失败 |
+| 20:23:35 | `JSON parse failed: body: <html>` | AI 接口返回 HTML 而非 JSON |
+| 20:23:35 起（每次同步） | `GET /api/note network error: tlsv1 alert protocol version` | FNS 服务器 TLS 握手被拒 |
+
+佐证：
+
+- 两个独立服务端点（api.deepseek.com + notesync.xzymoon.top:8444）同时
+  出网络层错误；PC 侧实测两服务均正常（0.36s 返回 401 / 0.1s 返回 200，
+  TLS 验证通过）→ 故障在 Kindle 当前 WiFi 环境（典型：需登录的门户 WiFi、
+  路由器劫持、WiFi 假连接）。
+- 昨天（08/17）同一 Kindle、同一配置端到端成功（12:39 success + committed）。
+- 部署确认：Kindle main.lua 19:58:52 拷贝，已含新代码（grep `Q+A merged` 命中）。
+
+影响与恢复：
+
+- 今天的高亮不丢：同步失败自动进 M6 离线队列（日志见 queue sync fail +
+  back-off），网络恢复后自动重试，或菜单手动"立即同步"。
+- 处理建议：断开 USB、换网络（如手机热点）重试问 AI；网络通了再按下方
+  实测清单验证 Q+A 合并功能。
+
 ## 改动 1：问 AI 加入笔记时合并"问题 + 回答"（M8 优化）
 
 ### 背景
