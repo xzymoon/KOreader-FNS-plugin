@@ -12,8 +12,9 @@
 - **push 记录**：master 0ac7b89 → **97ac808** 已推送（快进合并
   feat/m8-ai-chat，6 个 commit）；feat/m8-ai-chat 同步推送。
 - **release**：tag **v1.1.0** 已推送（v1.0.0 → v1.1.0 覆盖 M6 离线队列 +
-  M7 跨设备双向同步 + M8 AI 阅读助手）；GitHub Release 页面待 gh 认证
-  后创建。
+  M7 跨设备双向同步 + M8 AI 阅读助手）；GitHub Release 已创建——
+  https://github.com/xzymoon/KOreader-FNS-plugin/releases/tag/v1.1.0
+  （gh 认证走本地代理 127.0.0.1:7897 完成 web 设备码登录）。
 
 ## 实测复盘：20:41 网络恢复后 Q+A 合并实测成功 → 用户决策 A+B 去掉占位符
 
