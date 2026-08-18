@@ -2,6 +2,19 @@
 
 # 2026-08-18 daily progress
 
+## 收尾：push + v1.1.0 release
+
+- **主要任务汇总**：
+  1. 问 AI"加入笔记"合并问题+回答（12ec20f + 2861ffa），Kindle 复测通过。
+  2. 首测"AI 回复解析失败"诊断：Kindle WiFi 网络层故障（DNS/TLS/HTML
+     劫持三症状），非代码问题；换网后成功，诊断记录 a3368b4。
+  3. README 中英文同步更新"问题+回答成对写入"描述（97ac808）。
+- **push 记录**：master 0ac7b89 → **97ac808** 已推送（快进合并
+  feat/m8-ai-chat，6 个 commit）；feat/m8-ai-chat 同步推送。
+- **release**：tag **v1.1.0** 已推送（v1.0.0 → v1.1.0 覆盖 M6 离线队列 +
+  M7 跨设备双向同步 + M8 AI 阅读助手）；GitHub Release 页面待 gh 认证
+  后创建。
+
 ## 实测复盘：20:41 网络恢复后 Q+A 合并实测成功 → 用户决策 A+B 去掉占位符
 
 换网后实测成功：AI@ 块成对出现【问】【答】，同步到 Obsidian 正常。
