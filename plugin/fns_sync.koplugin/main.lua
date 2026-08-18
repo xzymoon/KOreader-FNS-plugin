@@ -625,8 +625,9 @@ function FnsSync:_openAiResponseViewer()
     UIManager:show(self._ai_response_viewer)
 end
 
--- M8 Task E: 把最后一条 AI 回复作为 AI@ 块写入笔记。
--- 决策 3：取 session.messages 最后一条 assistant。
+-- M8 Task E: 把最后一问一答作为 AI@ 块写入笔记。
+-- 决策 3：取 session.messages 最后一条 assistant（2026-08-18 起连同
+-- 对应问题一起写入，问题中的原文替换为〔原文〕占位）。
 -- 决策 4：多次加产生多个 AI@ 块（每次新 ts）。
 -- 决策 9：触发 _triggerSync，失败时沿用 M6 队列暂存。
 function FnsSync:_addAiContentToNote()
@@ -636,17 +637,43 @@ function FnsSync:_addAiContentToNote()
         return
     end
 
-    -- 取最后一条 assistant
+    -- 取最后一条 assistant（同时记下位置，用于向上找对应的问题）
     local last_assistant
+    local last_assistant_idx
     for i = #session.messages, 1, -1 do
         if session.messages[i].role == "assistant" then
             last_assistant = session.messages[i].content
+            last_assistant_idx = i
             break
         end
     end
     if not last_assistant then
         UIManager:show(InfoMessage:new{ text = _("AI 还未回复，无内容可加入"), timeout = 2 })
         return
+    end
+
+    -- 找该回答对应的问题：从回答位置向上找最近的 user 消息。下限 3 ——
+    -- messages[1] 是 system、messages[2] 是"【原文摘录】"引导消息，都不算
+    -- 问题。找不到（正常流程不可达，防御）→ 只写回答。
+    local last_question
+    for i = last_assistant_idx - 1, 3, -1 do
+        if session.messages[i].role == "user" then
+            last_question = session.messages[i].content
+            break
+        end
+    end
+
+    -- 问题 + 回答一起写入。快捷提问模板会把高亮原文整段带进问题，但原文
+    -- 已在紧邻的 HL@ 块里，替换成〔原文〕占位标记避免重复。原文按字节
+    -- 转义（中文多字节逐字节转后仍表字面量），防止原文含 % ( ) 等
+    -- Lua 模式特殊字符导致错配。
+    local note_content
+    if last_question then
+        local escaped = (session.original_text:gsub("([^%w])", "%%%1"))
+        local q = (last_question:gsub(escaped, "〔原文〕"))
+        note_content = "【问】\n" .. q .. "\n\n【答】\n" .. last_assistant
+    else
+        note_content = last_assistant
     end
 
     -- A1 防重复（2026-08-15 用户决策）：加入后不再关闭对话框，误触两次
@@ -664,7 +691,7 @@ function FnsSync:_addAiContentToNote()
     table.insert(self._pending_ai_blocks, {
         ts = ts,
         hl_ts = session.hl_ts,
-        content = last_assistant,
+        content = note_content,
         model = self.settings.ai_model or "unknown",
         book_path = book_path,  -- H-5 fix: bind to current book for drain filtering
     })
@@ -678,8 +705,8 @@ function FnsSync:_addAiContentToNote()
         text = _("已加入笔记，可继续追问"),
         timeout = 3,
     })
-    logger.info(("[FNS-AI] queued AI@ block ts=%s hl_ts=%s chars=%d book=%s"):format(
-        ts, tostring(session.hl_ts), #last_assistant, tostring(book_path)))
+    logger.info(("[FNS-AI] queued AI@ block ts=%s hl_ts=%s chars=%d (Q+A merged) book=%s"):format(
+        ts, tostring(session.hl_ts), #note_content, tostring(book_path)))
 
     -- H-3 fix: cancel any pending M5 debounce timer so we don't double-sync
     -- (saveHighlight from Task C callback triggers AnnotationsModified →

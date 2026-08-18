@@ -430,5 +430,29 @@ do
         and out[1].ts == "hl-3" and out[2].ts == "ai-3")
 end
 
+-- 27. Q+A merged content (2026-08-18 main.lua change): _addAiContentToNote
+-- now writes "【问】…\n\n【答】…" (question with 〔原文〕 placeholder) into the
+-- AI@ block. Marker layer must treat it as opaque: drain→serialize→parse→
+-- serialize stable, labels and special chars intact.
+do
+    local q_a = "【问】\n请把下面这段话翻译成中文：\n\n〔原文〕\n\n【答】\n这是一段翻译。\n\n第二段 (含特殊字符 %d 与括号)。"
+    local pending = {
+        { ts = "2026-08-18 10:00:01", hl_ts = "2026-08-18 10:00:00", content = q_a,
+          model = "deepseek-chat", book_path = "/b" },
+    }
+    local segs = { { type = "hl", ts = "2026-08-18 10:00:00", content = "原文" } }
+    local _, new_segs = Marker.drainAiBlocks(pending, segs, "/b")
+    local out1 = Marker.serialize(new_segs)
+    local out2 = Marker.serialize(Marker.parse(out1))
+    check("qa: drain→serialize→parse→serialize stable", out2 == out1)
+    local parsed_ai
+    for _, s in ipairs(Marker.parse(out1)) do
+        if s.type == "ai" then parsed_ai = s break end
+    end
+    check("qa: content preserved verbatim", parsed_ai ~= nil and parsed_ai.content == q_a)
+    check("qa: 【问】 label intact", out1:find("【问】", 1, true) ~= nil)
+    check("qa: 【答】 label intact", out1:find("【答】", 1, true) ~= nil)
+end
+
 print(("== Tests: %d passed, %d failed =="):format(tests_passed, tests_failed))
 os.exit(tests_failed == 0 and 0 or 1)
