@@ -431,11 +431,13 @@ do
 end
 
 -- 27. Q+A merged content (2026-08-18 main.lua change): _addAiContentToNote
--- now writes "【问】…\n\n【答】…" (question with 〔原文〕 placeholder) into the
--- AI@ block. Marker layer must treat it as opaque: drain→serialize→parse→
--- serialize stable, labels and special chars intact.
+-- writes "【问】…\n\n【答】…" into the AI@ block — quick prompts record a
+-- short label (翻译/解释/评论), hand-typed questions drop the embedded
+-- original text entirely (no placeholder). Marker layer must treat it as
+-- opaque: drain→serialize→parse→serialize stable, labels and special
+-- chars intact.
 do
-    local q_a = "【问】\n请把下面这段话翻译成中文：\n\n〔原文〕\n\n【答】\n这是一段翻译。\n\n第二段 (含特殊字符 %d 与括号)。"
+    local q_a = "【问】\n翻译\n\n【答】\n这是一段翻译。\n\n第二段 (含特殊字符 %d 与括号)。"
     local pending = {
         { ts = "2026-08-18 10:00:01", hl_ts = "2026-08-18 10:00:00", content = q_a,
           model = "deepseek-chat", book_path = "/b" },

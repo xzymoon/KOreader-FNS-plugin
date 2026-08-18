@@ -548,7 +548,7 @@ function FnsSync:_openAiResponseViewer()
     -- Render conversation as plain-text (no emoji — Kindle e-ink).
     local parts = {}
     -- M8 Task E 决策 5 (C-2): 顶部固定提示
-    table.insert(parts, _("提示：加入笔记将写入最后一条 AI 回答，可先用【让 AI 总结】生成精炼内容。"))
+    table.insert(parts, _("提示：加入笔记将写入最后一问一答，可先用【让 AI 总结】生成精炼内容。"))
     table.insert(parts, "")
     table.insert(parts, "【原文摘录】")
     table.insert(parts, session.original_text or "")
@@ -627,7 +627,7 @@ end
 
 -- M8 Task E: 把最后一问一答作为 AI@ 块写入笔记。
 -- 决策 3：取 session.messages 最后一条 assistant（2026-08-18 起连同
--- 对应问题一起写入，问题中的原文替换为〔原文〕占位）。
+-- 对应问题一起写入；快捷提问只记标签，手输问题删除其中原文，不留占位）。
 -- 决策 4：多次加产生多个 AI@ 块（每次新 ts）。
 -- 决策 9：触发 _triggerSync，失败时沿用 M6 队列暂存。
 function FnsSync:_addAiContentToNote()
@@ -663,15 +663,36 @@ function FnsSync:_addAiContentToNote()
         end
     end
 
-    -- 问题 + 回答一起写入。快捷提问模板会把高亮原文整段带进问题，但原文
-    -- 已在紧邻的 HL@ 块里，替换成〔原文〕占位标记避免重复。原文按字节
-    -- 转义（中文多字节逐字节转后仍表字面量），防止原文含 % ( ) 等
-    -- Lua 模式特殊字符导致错配。
+    -- 问题 + 回答一起写入（2026-08-18 用户决策 A+B：笔记里不出现原文，
+    -- 也不出现占位标记）。快捷提问（翻译/解释/评论）精确匹配后只记标签；
+    -- 其余问题把完整包含的原文整段删掉（原文已在紧邻的 HL@ 块里）。
+    -- 模板填充比对复刻按钮填充的 gsub 写法（含同样的 % 边界行为），保证
+    -- 比对结果与实际发出的问题一致；删除原文时按字节转义（中文多字节
+    -- 逐字节转后仍表字面量），防原文含 % ( ) 等 Lua 模式特殊字符。
     local note_content
     if last_question then
-        local escaped = (session.original_text:gsub("([^%w])", "%%%1"))
-        local q = (last_question:gsub(escaped, "〔原文〕"))
-        note_content = "【问】\n" .. q .. "\n\n【答】\n" .. last_assistant
+        local q
+        local quick_labels = { translate = _("翻译"), explain = _("解释"), comment = _("评论") }
+        for key, label in pairs(quick_labels) do
+            local template = self.settings.ai_quick_prompts and self.settings.ai_quick_prompts[key]
+            if template then
+                local filled = (template:gsub("{text}", session.original_text))
+                if last_question == filled then
+                    q = label
+                    break
+                end
+            end
+        end
+        if not q then
+            local escaped = (session.original_text:gsub("([^%w])", "%%%1"))
+            q = (last_question:gsub(escaped, ""))
+            q = q:gsub("^%s+", ""):gsub("%s+$", "")
+        end
+        if q ~= "" then
+            note_content = "【问】\n" .. q .. "\n\n【答】\n" .. last_assistant
+        else
+            note_content = last_assistant
+        end
     else
         note_content = last_assistant
     end
