@@ -46,7 +46,7 @@ isConfigured() = server_url + api_token + vault 全非空
 ```lua
 LocalStore:getNote(settings, path)                  -- io.open 读；不存在 → exists=false
 LocalStore:overwriteNote(settings, path, content)   -- 写回
-LocalStore:createNote(settings, path, content)      -- lfs.mkdir 逐级 + 写入
+LocalStore:createNote(settings, path, content)      -- util.makePath + 写入
 ```
 
 本地根目录 = `<Kindle 用户分区>/FNS-Notes/` + resolvePath 相对路径
@@ -84,7 +84,7 @@ FNS 模式（现状）:
 
 | 文件 | 改动 | 预估 |
 |------|------|------|
-| `localstore.lua` | 新增：LocalStore 三方法 + 逐级 mkdir + 根目录常量 | ~80 行 |
+| `localstore.lua` | 新增：LocalStore 三方法 + `util.makePath`（KOReader 现成 mkdir -p）+ `filemanagerutil.getHomeFolder()` 根目录 | ~80 行 |
 | `main.lua` | ① `_triggerSync`：isConfigured false → 路由本地分支；② `_doSyncCurrentBookLegacy` 参数化 store；③ 菜单：本地模式下同步按钮文案「同步到本地笔记」+ 新增「查看本地笔记」；④ D4 种子上传：first-create 分支检查本地 md 存在则用其内容 | ~200 行 |
 | `config.lua` | DEFAULTS 加 `local_notes_root`（默认 "FNS-Notes/"，可改） | ~3 行 |
 | `_meta.lua` | 版本号提升 | 1 行 |
@@ -117,3 +117,43 @@ Kindle 实测清单（实现后执行）：
 - **不做的事**：note 字段回写、本地 md 手动编辑的双向合并（本地模式下
   用户改 md 文件外的内容会被保留——parse 只重写 marker 区间，与服务器
   模式同语义）。
+
+## 二轮审查（2026-08-22，对照 E:\koreader-src 源码）
+
+### KOReader 兼容性验证（结论：全部可行，一处修订）
+
+| 设计假设 | 验证结果 |
+|----------|----------|
+| 逐级 mkdir 自己实现 | **修订**：KOReader 有现成 `util.makePath(path)`（frontend/util.lua:855，mkdir -p 语义，已存在不报错），LocalStore 直接调用，不自己写 |
+| 根目录"Kindle 用户分区"如何定位 | `filemanagerutil.getHomeFolder()`（filemanagerutil.lua:25）：`G_reader_settings home_dir → Device.home_dir → "."`，Kindle 上即 /mnt/us。bookshortcuts.koplugin/main.lua:69 同款用法（使用点运行时 require，filemanagerutil 是纯函数模块无 UI 依赖） |
+| io.open 覆盖写文件 | 官方 exporter.koplugin/target/markdown.lua:108 同款直接 `io.open(path, "w")` 覆盖写，无原子写惯例——LocalStore 照此即可（tmp+rename 可选优化，非必须） |
+| lfs 的 require 方式 | 插件标准：`require("libs/libkoreader-lfs")`（bookshortcuts/coverimage/coverbrowser 同款） |
+| `require("util")` | 本项目已在用（excerpt.lua:18、api.lua:30），零新增依赖 |
+| TextViewer 查看笔记 | main.lua:49 已 require，AI 对话窗口已在用 |
+| 本地模式绕过 runWhenOnline | 现有 `opts.skip_run_when_online` 参数（main.lua:1141/1217）直接复用——飞行模式下本地同步不弹"开 WiFi" |
+| 中文文件名 | KOReader 书籍本身就是中文名；resolvePath 的 util.getSafeFilename 已处理 |
+
+### 设计缺口（审查发现，5 项）
+
+| # | 级别 | 缺口 | 处置 |
+|---|------|------|------|
+| G1 | CRITICAL | **`enabled` 总开关挡住本地模式**：DEFAULTS `enabled=false`（config.lua:116），`_triggerSync` 先查 enabled 再查 isConfigured（main.lua:1156/1162）——新用户没开总开关时本地模式不工作，"即装即用"落空。且菜单项 `enabled and isConfigured()`（main.lua:2661 等）在本地模式全灰 | 待拍板（见下） |
+| G2 | HIGH | **手动同步的 runWhenOnline 包装**：本地模式无需网络，必须传 skip_run_when_online=true，否则飞行模式点"同步到本地笔记"被弹开网提示 | 实现时本地分支固定 skip（技术细节，直接定） |
+| G3 | MEDIUM | **D4 种子上传后本地 md 的处置没写**：上传成功后若保留原文件，FNS 模式今后只写服务器，本地文件停在旧状态，用户翻 FNS-Notes/ 会看到过期内容 | 待拍板（见下） |
+| G4 | MEDIUM | **LocalStore 返回结构兼容细节**：Api:getNote 返回 `{ok, exists, content, note={ctime}}`，overwriteNote 带 original_ctime 乐观锁。本地实现：`lfs.attributes(path).modification` 充当 ctime；V1 乐观锁直接忽略（单客户端单设备场景，外部并发改写风险低），结构字段对齐 | 实现时对齐（技术细节，直接定） |
+| G5 | LOW | **M5 自动同步 gating 未提**：`_gateAutoSync`（main.lua:1959）含 isConfigured，本地模式下高亮后自动写本地 md（debounce 照旧）需把该检查改为"或本地模式可用"。建议自动也写（体验一致，本地写快） | 按建议实现（技术细节，直接定） |
+
+G1 选项：
+
+- (a) 本地模式尊重 enabled 总开关：用户装完插件开一次"启用"，之后
+  isConfigured 不再拦截本地分支；菜单项 enabled_func 放宽为只看 enabled，
+  模式路由在触发时判断（按钮文案"同步笔记"，本地模式实际写本地）。
+- (b) 本地模式无视 enabled：即装即用最彻底，但总开关语义被破坏
+  （用户"关闭"插件后仍写文件）。
+
+G3 选项：
+
+- (a) 上传成功后本地 md 重命名为 `<原名>.uploaded.bak`：防误删用户可能
+  手改过的内容，FNS-Notes/ 里不再有"看似最新"的旧文件。
+- (b) 直接删除本地文件：干净，但用户手改内容会丢。
+- (c) 原样保留：实现最简，但有"过期内容"困惑。

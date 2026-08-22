@@ -47,6 +47,34 @@ AskUserQuestion 三项拍板（均选推荐项）：
 - 预估核心改动：localstore.lua 新增 ~80 行 + main.lua ~200 行 +
   config.lua ~3 行 + 单测 ~150 行
 
+## 二轮审查：设计文档自查 + KOReader 源码兼容性验证
+
+### 兼容性验证（对照 E:\koreader-src，全部可行，一处修订）
+
+- **修订**：LocalStore 不自己写逐级 mkdir——KOReader 有现成
+  `util.makePath(path)`（frontend/util.lua:855，mkdir -p 语义）。
+- 根目录定位：`filemanagerutil.getHomeFolder()`
+  （`G_reader_settings home_dir → Device.home_dir → "."`，Kindle 即
+  /mnt/us）；bookshortcuts.koplugin/main.lua:69 同款用法（运行时 require，
+  纯函数模块无 UI 依赖）。
+- 写文件惯例：官方 exporter.koplugin/target/markdown.lua:108 直接
+  `io.open(path, "w")` 覆盖写、无原子写——LocalStore 照此，tmp+rename
+  为可选优化。
+- lfs require：插件标准 `require("libs/libkoreader-lfs")`。
+- `require("util")` 本项目已在用（excerpt.lua:18），零新增依赖。
+- runWhenOnline 绕过：现有 `opts.skip_run_when_online`
+  （main.lua:1141/1217）直接复用，飞行模式本地同步不弹开网提示。
+
+### 审查发现的设计缺口（G1-G5，已写入设计文档"二轮审查"章节）
+
+| # | 级别 | 缺口 | 状态 |
+|---|------|------|------|
+| G1 | CRITICAL | `enabled` 总开关（DEFAULTS false，config.lua:116）挡住本地模式；菜单项 `enabled and isConfigured()` 本地模式全灰 | 待用户拍板 (a)尊重总开关 / (b)无视 |
+| G2 | HIGH | 本地分支必须 skip_run_when_online，否则飞行模式弹开网提示 | 实现时固定 skip |
+| G3 | MEDIUM | D4 种子上传后本地 md 处置（保留会有过期内容困惑） | 待用户拍板 (a)重命名 .uploaded.bak / (b)删除 / (c)保留 |
+| G4 | MEDIUM | LocalStore 返回结构对齐 Api（ctime 用 lfs attributes.modification；V1 忽略乐观锁） | 实现时对齐 |
+| G5 | LOW | M5 自动同步 gating（_gateAutoSync main.lua:1959）需模式感知，建议本地自动写 | 按建议实现 |
+
 ### 下一步
 
-用户确认后开始实现（待询问"是否可以开始改动"）。
+用户拍板 G1/G3 → 更新设计文档 → 询问"是否可以开始改动"。
