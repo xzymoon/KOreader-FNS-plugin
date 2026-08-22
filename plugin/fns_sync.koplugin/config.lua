@@ -125,6 +125,10 @@ Config.DEFAULTS = {
     note_filename_template   = "《{title}》读书笔记.md",
     note_template            = Config.DEFAULT_NOTE_TEMPLATE,
 
+    -- M9 local mode: root folder (under KOReader home dir, e.g. /mnt/us on
+    -- Kindle) for notes written when no FNS server is configured.
+    local_notes_root         = "FNS-Notes/",
+
     -- Per-book title/author overrides.
     -- Keyed by absolute file path of the book (self.ui.document.file).
     -- Each value is { title = "...", author = "..." }; fields are optional.

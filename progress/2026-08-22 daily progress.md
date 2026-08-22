@@ -78,3 +78,70 @@ AskUserQuestion 三项拍板（均选推荐项）：
 ### 下一步
 
 用户拍板 G1/G3 → 更新设计文档 → 询问"是否可以开始改动"。
+
+## M9 实现完成（用户确认"好的"后开始改动）
+
+### 新增文件
+
+- **`plugin/fns_sync.koplugin/localstore.lua`**（~120 行）：LocalStore 存储
+  后端，与 Api 签名/返回结构兼容的 getNote/overwriteNote/createNote +
+  markUploaded（G3 重命名）。根目录 = `filemanagerutil.getHomeFolder()`
+  （惰性 require，bookshortcuts 同款）+ `local_notes_root`（默认
+  "FNS-Notes/"）；目录创建用 KOReader 现成 `util.makePath`（mkdir -p）；
+  overwriteNote 自动重建被清空的根目录；V1 忽略乐观锁（G4）。
+- **`tests/test_localstore.lua`**（28 项断言）：mock util/lfs/
+  filemanagerutil/gettext/logger，真实文件 IO 端到端（临时目录），覆盖
+  读/建/写/重命名/already_exists/失败结构。
+
+### main.lua 改动（+130/-21）
+
+| 位置 | 改动 |
+|------|------|
+| 头部 | `require("localstore")` |
+| `isConfigured` 后 | 新增 `_isLocalMode()`（= not isConfigured，派生非配置） |
+| `_triggerSync` | isConfigured 拦截 → 本地模式放行（G1 尊重 enabled）；本地强制 skip runWhenOnline（G2 飞行模式不弹开网）；空 annotations 本地当 push-only（bidirectional 残留 true 不放行） |
+| `_doSyncCurrentBook` | local_mode 参数 → 强制 Legacy + LocalStore 注入 |
+| `_doSyncCurrentBookLegacy` | store 参数（默认 Api）；getNote/overwriteNote/createNote 三处换 store；**D4 种子**：FNS first-create 时本地 md 存在 → 转走 exists 分支（diff 合并后 overwrite 上传）；**G3**：POST 成功后 markUploaded 重命名 |
+| `_gateAutoSync` | 删 isConfigured 检查（G5 本地自动写） |
+| `_autoSyncCurrentBook` | 本地模式跳过 isOnline/队列，直接 silent 本地同步 |
+| `_showSyncError` | 新增 local_error 分支（"本地文件读写失败："） |
+| 菜单 | 主按钮 text_func（本地模式"同步到本地笔记"）+ enabled 放宽（只看 enabled）；"高亮修改时同步"/"关闭书籍时同步"放宽；新增"查看本地笔记"（onViewLocalNote → TextViewer）；双向/拉取/离线队列**保留** isConfigured（本地无意义） |
+| `_addAiContentToNote` | 仅注释更新（本地模式失败不入 M6 队列，pending 保留重试） |
+
+无需改动（已有机制天然兼容）：`_processQueue` 的 isConfigured skip；
+`_pullRemoteHighlights` 的 isConfigured 拦截；M6 队列调用 Legacy 4 参数
+（store 默认 Api）；问 AI 入口（只看 ai_enabled）。
+
+### config.lua
+
+DEFAULTS 新增 `local_notes_root = "FNS-Notes/"`。
+
+### 测试插曲：Windows ANSI 代码页坑
+
+test_localstore 首跑 createNote 全挂——排查：测试文件（UTF-8）里中文
+文件名经 LuaJIT ANSI `io.open`/`os.execute` 按 GBK 代码页解释成乱码
+路径（lua -e 复现"成功"是因为 bash 已把参数转成 GBK 字节，碰巧对上）。
+**Kindle 是 Linux UTF-8 字节透传环境，无此问题**（真机中文路径由
+Kindle 实测覆盖）。修正：IO 用例改 ASCII 文件名，中文路径逻辑由
+`_absPath` 纯字符串用例覆盖，测试头部注释记录原因。
+
+### 测试结果
+
+- **test_localstore：28 passed, 0 failed**（新增）
+- test_marker_ai：83 passed / test_ai_chat：23 / test_config_ai：14 /
+  test_threeway：19 —— **全部 0 failed**
+- main.lua / localstore.lua / config.lua loadfile 语法检查 OK
+
+### Kindle 实测清单（待用户执行）
+
+1. 不配 FNS（或清空服务配置）→ 开插件总开关 enabled → 高亮一段 →
+   菜单"同步到本地笔记" → USB 看 `/mnt/us/FNS-Notes/KOReader/《书名》读书笔记.md`
+   生成、HL@ 块正确。
+2. 问 AI → 翻译 → 加入笔记 → 本地 md 出现 AI@ 块（【问】"翻译" +
+   【答】全文）。
+3. 删高亮 → 再同步 → 对应 AI@ 块级联删除。
+4. 菜单"查看本地笔记" → TextViewer 显示最新内容。
+5. 飞行模式重复 1 → 不弹"开 WiFi"提示，本地写入正常（G2）。
+6. 配上 FNS → 同步 → 服务器出现该笔记且含本地历史 AI@（种子上传），
+   本地文件变 `.uploaded.bak`（G3）。
+7. crash.log grep `[FNS]`，`M9 local mode` 日志路径正常。

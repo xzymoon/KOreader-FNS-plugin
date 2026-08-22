@@ -58,6 +58,7 @@ local Config = require("config")
 local Api = require("api")
 local Ai = require("ai")
 local Excerpt = require("excerpt")
+local LocalStore = require("localstore")
 local Marker = require("marker")
 local Threeway = require("threeway")
 local Event = require("ui/event")
@@ -734,7 +735,8 @@ function FnsSync:_addAiContentToNote()
     -- M5 schedules a debounced sync; this cancel avoids a redundant POST).
     self:_cancelAutoSyncTimer()
 
-    -- 触发同步（沿用 M5 路径；失败自动入 M6 队列）
+    -- 触发同步（沿用 M5 路径；失败自动入 M6 队列。M9 本地模式：写本地
+    -- 文件，失败不入队——pending AI 块保留在 G_reader_settings 下次重试）
     self:_triggerSync({ silent = false })
 end
 
@@ -1010,6 +1012,14 @@ function FnsSync:isConfigured()
         and self.settings.vault ~= ""
 end
 
+--- M9: local mode = FNS server NOT configured. Notes are then written to
+--- local files under <home>/<local_notes_root>/ via LocalStore instead of
+--- POSTed to the server (same legacy pipeline, store injection). Derived,
+--- not a user setting: configure FNS and local mode turns itself off.
+function FnsSync:_isLocalMode()
+    return not self:isConfigured()
+end
+
 --- Run the test connection probe and show result via InfoMessage.
 function FnsSync:onTestConnection()
     if not self:isConfigured() then
@@ -1113,7 +1123,11 @@ function FnsSync:_showSyncError(result)
     local raw_msg = result.message
     local safe_msg = _sanitizeServerMessage(raw_msg)
     local msg
-    if result.network_error then
+    if result.local_error then
+        -- M9: LocalStore failure (disk full / permissions / bad filename)
+        msg = _("本地文件读写失败：") .. (safe_msg ~= "" and safe_msg or _("未知错误"))
+        logger.warn("[FNS] local store error: " .. safe_msg)
+    elseif result.network_error then
         msg = _("网络错误：") .. (safe_msg ~= "" and safe_msg or _("未知错误"))
         logger.warn("[FNS] sync error (network): " .. safe_msg)
     else
@@ -1159,18 +1173,20 @@ function FnsSync:_triggerSync(opts)
         end
         return
     end
-    if not self:isConfigured() then
-        if not silent then
-            UIManager:show(InfoMessage:new{ text = _("请先配置服务 URL / Token / Vault") })
-        end
-        return
+    -- M9: 未配置 FNS → 本地模式（笔记写本地文件，无需服务器）。G1 拍板：
+    -- 本地模式仍尊重 enabled 总开关（上面已检查），这里不再拦截。
+    local local_mode = self:_isLocalMode()
+    if local_mode then
+        logger.info("[FNS] M9 local mode: sync will write local files")
     end
     local annotations = self.ui and self.ui.annotation
         and self.ui.annotation.annotations or {}
     -- Bidirectional path (M7): allow empty annotations — first-time pull
     -- after enabling the toggle legitimately has zero local highlights
     -- (entire round is server → local). Only short-circuit when push-only.
-    if #annotations == 0 and not self.settings.bidirectional_sync_enabled then
+    -- M9: local mode has no remote to pull from → always push-only here,
+    -- even if bidirectional_sync_enabled is a leftover true from FNS days.
+    if #annotations == 0 and (local_mode or not self.settings.bidirectional_sync_enabled) then
         if not silent then
             UIManager:show(InfoMessage:new{ text = _("当前书没有高亮/笔记") })
         end
@@ -1190,7 +1206,7 @@ function FnsSync:_triggerSync(opts)
         end
         UIManager:nextTick(function()
             local ok, err = pcall(function()
-                self:_doSyncCurrentBook(annotations, meta, path, silent)
+                self:_doSyncCurrentBook(annotations, meta, path, silent, local_mode)
             end)
             -- Finally block: reset BOTH locks regardless of pcall outcome.
             -- _sync_in_flight protects this entry; _pull_in_flight is set
@@ -1214,7 +1230,9 @@ function FnsSync:_triggerSync(opts)
             end
         end)
     end
-    if opts.skip_run_when_online then
+    -- M9 G2: 本地模式无需网络——直接执行，不包 runWhenOnline，飞行模式下
+    -- 点"同步到本地笔记"不会弹"开 WiFi"提示。
+    if opts.skip_run_when_online or local_mode then
         run()
     else
         NetworkMgr:runWhenOnline(run)
@@ -1232,6 +1250,38 @@ function FnsSync:onSyncCurrentBook()
     self:_triggerSync{ silent = false }
 end
 
+--- M9 (D3): open the current book's local note file in a TextViewer.
+--- Works in BOTH modes: in FNS mode the local file only exists before the
+--- first seed upload (then it becomes .uploaded.bak), so this mainly
+--- serves local mode — but FNS users can still peek at a pre-upload file.
+function FnsSync:onViewLocalNote()
+    logger.info("[FNS] event: onViewLocalNote")
+    if not (self.ui and self.ui.document) then
+        UIManager:show(InfoMessage:new{ text = _("请先打开一本书"), timeout = 2 })
+        return
+    end
+    local meta = self:_getBookMetadata()
+    local path = Excerpt:resolvePath(self.settings, meta)
+    local r = LocalStore:getNote(self.settings, path)
+    if not r.ok then
+        self:_showSyncError(r)
+        return
+    end
+    if not r.exists then
+        UIManager:show(InfoMessage:new{
+            text = _("本地笔记还不存在，先点一次同步生成"),
+            timeout = 3,
+        })
+        return
+    end
+    UIManager:show(TextViewer:new{
+        title = _("本地笔记"),
+        text = r.content,
+        text_type = "general",
+        add_default_buttons = true,
+    })
+end
+
 --- Dispatcher (M7): route to Legacy (M5/M6 behavior) or Bidirectional
 --- (M7 three-way merge with pull). bidirectional_sync_enabled defaults to
 --- nil/false until Day 2b wires it into Config.DEFAULTS — until then the
@@ -1239,14 +1289,23 @@ end
 --- by hand has no effect until Day 2b ships.
 --- Queue path (M6 _processQueueItem) calls _doSyncCurrentBookLegacy DIRECTLY
 --- (per user decision #4: 离线书不做拉取 — see progress 2026-08-06).
-function FnsSync:_doSyncCurrentBook(annotations, meta, path, silent)
+function FnsSync:_doSyncCurrentBook(annotations, meta, path, silent, local_mode)
+    -- M9: local mode always takes the Legacy shape with LocalStore injected
+    -- (bidirectional pull has no meaning without a remote).
+    if local_mode then
+        return self:_doSyncCurrentBookLegacy(annotations, meta, path, silent, LocalStore)
+    end
     if self.settings.bidirectional_sync_enabled then
         return self:_doSyncCurrentBookBidirectional(annotations, meta, path, silent)
     end
-    return self:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
+    return self:_doSyncCurrentBookLegacy(annotations, meta, path, silent, Api)
 end
 
-function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
+function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent, store)
+    -- M9: storage backend injection. Api (default) = FNS server; LocalStore
+    -- = local files. Signature/result compatible (see localstore.lua), so
+    -- the pipeline below runs unmodified for both.
+    store = store or Api
     -- Render current KOreader highlights into a { ts -> block_content } table.
     -- This is the source-of-truth for what should be in the note after sync.
     --
@@ -1271,10 +1330,29 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
 
     local highlights_by_ts = Excerpt:renderExcerptBlock(annotations, self.settings)
 
-    local get_result = Api:getNote(self.settings, path)
+    local get_result = store:getNote(self.settings, path)
     if not get_result.ok then
         if not silent then self:_showSyncError(get_result) end
         return { ok = false, reason = "get_failed", result = get_result }
+    end
+
+    -- M9 D4 (seed upload): FNS first-create but a local-mode note exists →
+    -- use it as the base content. Reuse the exists-branch diff pipeline
+    -- below so local content is merged with current highlights, then POST
+    -- via overwrite (FNS POST /api/note is modify-or-create). On POST
+    -- success the local file is renamed .uploaded.bak (G3).
+    local seed_uploaded = false
+    if not get_result.exists and store == Api then
+        local seed = LocalStore:getNote(self.settings, path)
+        if seed.ok and seed.exists then
+            logger.info("[FNS] M9 seed: local note found, seeding first FNS sync: " .. path)
+            get_result = {
+                ok = true, exists = true,
+                content = seed.content,
+                note = { ctime = seed.note and seed.note.ctime },
+            }
+            seed_uploaded = true
+        end
     end
 
     if get_result.exists then
@@ -1339,8 +1417,13 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
 
 
         local original_ctime = get_result.note and get_result.note.ctime
-        local post_result = Api:overwriteNote(self.settings, path, new_content, original_ctime)
+        local post_result = store:overwriteNote(self.settings, path, new_content, original_ctime)
         if post_result.ok then
+            -- M9 G3: seed uploaded → rename local file so FNS-Notes/ keeps
+            -- no stale copy (never deletes user content).
+            if seed_uploaded then
+                LocalStore:markUploaded(self.settings, path)
+            end
             -- E-step1 review fix: only commit drained AI@ blocks after POST success
             self:_commitDrainedAi(drained)
             local n_ins, n_upd, n_del = 0, 0, 0
@@ -1382,7 +1465,7 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent)
             end
         end
 
-        local create_result = Api:createNote(self.settings, path, new_content)
+        local create_result = store:createNote(self.settings, path, new_content)
         if create_result.ok then
             -- E-step1 review fix: commit drained AI@ blocks only after create success
             self:_commitDrainedAi(drained)
@@ -1950,13 +2033,15 @@ end
 -- Auto-sync (M5)
 -- ===========================================================================
 
---- Four-gate check: enabled AND auto_sync_enabled AND isConfigured AND
--- (a book is open). Per-event sub-switches are checked by the callers
--- (this only checks gates shared by both highlight and close paths).
+-- Gate check: enabled AND auto_sync_enabled AND (a book is open).
+-- Per-event sub-switches are checked by the callers (this only checks
+-- gates shared by both highlight and close paths).
+-- M9 (G5): isConfigured check removed — local mode auto-syncs to local
+-- files too (same UX; a local write is fast and offline-safe). Users who
+-- want no auto-write simply keep auto_sync_enabled off.
 function FnsSync:_gateAutoSync()
     if not self.settings.enabled then return false end
     if not self.settings.auto_sync_enabled then return false end
-    if not self:isConfigured() then return false end
     if not (self.ui and self.ui.annotation) then return false end
     return true
 end
@@ -1990,6 +2075,13 @@ end
 --- highlights to local metadata.lua, so nothing is lost; next open / close /
 --- manual sync catches up when online.
 function FnsSync:_autoSyncCurrentBook()
+    -- M9: 本地模式无需网络，也没有离线队列语义（本地写不产生网络失败）。
+    -- 直接走本地同步（silent + skip 网络）。
+    if self:_isLocalMode() then
+        logger.info("[FNS] M9 local mode: auto-sync writes local files directly")
+        self:_triggerSync({ silent = true, skip_run_when_online = true })
+        return
+    end
     if not NetworkMgr:isOnline() then
         -- M6: enqueue for auto-retry when NetworkConnected fires.
         -- (M5 only logged "will catch up on next trigger"; M6 makes it
@@ -2566,10 +2658,10 @@ function FnsSync:addToMainMenu(menu_items)
                     {
                         text = _("高亮修改时同步"),
                         checked_func = function() return self.settings.sync_on_highlight end,
+                        -- M9 G5: local mode auto-syncs too — no isConfigured gate
                         enabled_func = function()
                             return self.settings.enabled
                                and self.settings.auto_sync_enabled
-                               and self:isConfigured()
                         end,
                         callback = function() self:_toggleBool("sync_on_highlight") end,
                     },
@@ -2579,7 +2671,6 @@ function FnsSync:addToMainMenu(menu_items)
                         enabled_func = function()
                             return self.settings.enabled
                                and self.settings.auto_sync_enabled
-                               and self:isConfigured()
                         end,
                         callback = function() self:_toggleBool("sync_on_book_close") end,
                     },
@@ -2759,11 +2850,26 @@ function FnsSync:addToMainMenu(menu_items)
 
             -- Actions
             {
-                text = _("立即同步当前书"),
+                -- M9: 本地模式（未配置 FNS）按钮照样可用，文案切换提示
+                -- 笔记去向（G1：尊重 enabled 总开关）。
+                text_func = function()
+                    if self:_isLocalMode() then
+                        return _("同步到本地笔记")
+                    end
+                    return _("立即同步当前书")
+                end,
                 enabled_func = function()
-                    return self.settings.enabled and self:isConfigured()
+                    return self.settings.enabled
                 end,
                 callback = function() self:onSyncCurrentBook() end,
+            },
+            -- M9 (D3): view the local note file for the current book
+            {
+                text = _("查看本地笔记"),
+                enabled_func = function()
+                    return self.settings.enabled
+                end,
+                callback = function() self:onViewLocalNote() end,
             },
             -- M7: manual pull button. Visible always, enabled only when
             -- bidirectional_sync_enabled is on (greyed out otherwise as a
