@@ -69,9 +69,9 @@ AskUserQuestion 三项拍板（均选推荐项）：
 
 | # | 级别 | 缺口 | 状态 |
 |---|------|------|------|
-| G1 | CRITICAL | `enabled` 总开关（DEFAULTS false，config.lua:116）挡住本地模式；菜单项 `enabled and isConfigured()` 本地模式全灰 | 待用户拍板 (a)尊重总开关 / (b)无视 |
+| G1 | CRITICAL | `enabled` 总开关（DEFAULTS false，config.lua:116）挡住本地模式；菜单项 `enabled and isConfigured()` 本地模式全灰 | **已拍板 (a)** 尊重总开关：开一次"启用"即用，isConfigured 不拦本地分支，菜单 enabled_func 放宽为只看 enabled |
 | G2 | HIGH | 本地分支必须 skip_run_when_online，否则飞行模式弹开网提示 | 实现时固定 skip |
-| G3 | MEDIUM | D4 种子上传后本地 md 处置（保留会有过期内容困惑） | 待用户拍板 (a)重命名 .uploaded.bak / (b)删除 / (c)保留 |
+| G3 | MEDIUM | D4 种子上传后本地 md 处置（保留会有过期内容困惑） | **已拍板 (a)** 重命名 `<原名>.uploaded.bak` |
 | G4 | MEDIUM | LocalStore 返回结构对齐 Api（ctime 用 lfs attributes.modification；V1 忽略乐观锁） | 实现时对齐 |
 | G5 | LOW | M5 自动同步 gating（_gateAutoSync main.lua:1959）需模式感知，建议本地自动写 | 按建议实现 |
 

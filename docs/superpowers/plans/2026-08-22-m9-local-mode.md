@@ -137,23 +137,8 @@ Kindle 实测清单（实现后执行）：
 
 | # | 级别 | 缺口 | 处置 |
 |---|------|------|------|
-| G1 | CRITICAL | **`enabled` 总开关挡住本地模式**：DEFAULTS `enabled=false`（config.lua:116），`_triggerSync` 先查 enabled 再查 isConfigured（main.lua:1156/1162）——新用户没开总开关时本地模式不工作，"即装即用"落空。且菜单项 `enabled and isConfigured()`（main.lua:2661 等）在本地模式全灰 | 待拍板（见下） |
+| G1 | CRITICAL | **`enabled` 总开关挡住本地模式**：DEFAULTS `enabled=false`（config.lua:116），`_triggerSync` 先查 enabled 再查 isConfigured（main.lua:1156/1162）——新用户没开总开关时本地模式不工作，"即装即用"落空。且菜单项 `enabled and isConfigured()`（main.lua:2661 等）在本地模式全灰 | **已拍板 (a)**：本地模式尊重 enabled 总开关（用户开一次"启用"），isConfigured 不再拦截本地分支；菜单项 enabled_func 放宽为只看 enabled，模式路由在触发时判断 |
 | G2 | HIGH | **手动同步的 runWhenOnline 包装**：本地模式无需网络，必须传 skip_run_when_online=true，否则飞行模式点"同步到本地笔记"被弹开网提示 | 实现时本地分支固定 skip（技术细节，直接定） |
-| G3 | MEDIUM | **D4 种子上传后本地 md 的处置没写**：上传成功后若保留原文件，FNS 模式今后只写服务器，本地文件停在旧状态，用户翻 FNS-Notes/ 会看到过期内容 | 待拍板（见下） |
+| G3 | MEDIUM | **D4 种子上传后本地 md 的处置没写**：上传成功后若保留原文件，FNS 模式今后只写服务器，本地文件停在旧状态，用户翻 FNS-Notes/ 会看到过期内容 | **已拍板 (a)**：上传成功后重命名 `<原名>.uploaded.bak`（防误删手改内容，目录里不留"看似最新"的旧文件） |
 | G4 | MEDIUM | **LocalStore 返回结构兼容细节**：Api:getNote 返回 `{ok, exists, content, note={ctime}}`，overwriteNote 带 original_ctime 乐观锁。本地实现：`lfs.attributes(path).modification` 充当 ctime；V1 乐观锁直接忽略（单客户端单设备场景，外部并发改写风险低），结构字段对齐 | 实现时对齐（技术细节，直接定） |
 | G5 | LOW | **M5 自动同步 gating 未提**：`_gateAutoSync`（main.lua:1959）含 isConfigured，本地模式下高亮后自动写本地 md（debounce 照旧）需把该检查改为"或本地模式可用"。建议自动也写（体验一致，本地写快） | 按建议实现（技术细节，直接定） |
-
-G1 选项：
-
-- (a) 本地模式尊重 enabled 总开关：用户装完插件开一次"启用"，之后
-  isConfigured 不再拦截本地分支；菜单项 enabled_func 放宽为只看 enabled，
-  模式路由在触发时判断（按钮文案"同步笔记"，本地模式实际写本地）。
-- (b) 本地模式无视 enabled：即装即用最彻底，但总开关语义被破坏
-  （用户"关闭"插件后仍写文件）。
-
-G3 选项：
-
-- (a) 上传成功后本地 md 重命名为 `<原名>.uploaded.bak`：防误删用户可能
-  手改过的内容，FNS-Notes/ 里不再有"看似最新"的旧文件。
-- (b) 直接删除本地文件：干净，但用户手改内容会丢。
-- (c) 原样保留：实现最简，但有"过期内容"困惑。
