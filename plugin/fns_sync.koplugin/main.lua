@@ -32,9 +32,6 @@ Current implementation:
     - Queue path (M6) bypasses bidirectional — always uses Legacy
       (user decision #4: 离线书不做拉取)
 
-Stubbed:
-  - onSyncAllHistory (M8+): walk history dir, batch sync per book
-
 Not in scope:
   - Encryption of queue at rest (accepted risk, see config.lua PII note)
   - Text-search fallback for cross-device book version mismatch (M8)
@@ -61,6 +58,8 @@ local Excerpt = require("excerpt")
 local LocalStore = require("localstore")
 local Marker = require("marker")
 local Threeway = require("threeway")
+local Gate = require("gate")
+local ConfImport = require("confimport")
 local Event = require("ui/event")
 
 local FnsSync = WidgetContainer:extend{
@@ -197,6 +196,17 @@ function FnsSync:init()
         end
 
         self.settings.config_version = Config.CURRENT_CONFIG_VERSION
+    end
+
+    -- M10: desktop-side conf import (plan §十一). Sits between migration
+    -- and the save below so imported values land in the same flush.
+    -- Fingerprint lives in a TOP-LEVEL G_reader_settings key so that
+    -- onResetConfig's whole-table replacement can't wipe it (reset must
+    -- not be undone by a stale conf re-import).
+    local prev_hash = G_reader_settings:readSetting("fns_sync_conf_hash")
+    local conf_result = ConfImport.checkAndImport(self.settings, prev_hash)
+    if conf_result.hash then
+        G_reader_settings:saveSetting("fns_sync_conf_hash", conf_result.hash)
     end
 
     G_reader_settings:saveSetting("fns_sync", self.settings)
@@ -1017,7 +1027,12 @@ end
 --- POSTed to the server (same legacy pipeline, store injection). Derived,
 --- not a user setting: configure FNS and local mode turns itself off.
 function FnsSync:_isLocalMode()
-    return not self:isConfigured()
+    -- M10: `enabled` is an explicit MODE switch (true=FNS server, false=
+    -- local/offline). Replaces M9's isConfigured() auto-derivation —
+    -- the G1 "enabled gates everything" ruling mis-led users (a switch
+    -- named "FNS 同步" must not control local notes / AI add-to-note).
+    -- See plan 2026-08-23 §二; pure logic in gate.lua.
+    return Gate.isLocalMode(self.settings)
 end
 
 --- Run the test connection probe and show result via InfoMessage.
@@ -1167,17 +1182,25 @@ function FnsSync:_triggerSync(opts)
         logger.info("[FNS] sync skipped: another in flight")
         return
     end
-    if not self.settings.enabled then
+    -- M10: enabled is a MODE switch (true=FNS server, false=local). Local
+    -- mode passes with zero extra switches (manual sync / auto-write / AI
+    -- add-to-note all allowed). FNS mode with incomplete service config:
+    -- hint the user (manual path) or log a skip (silent path) — never
+    -- silently fall back to local writes the user didn't ask for.
+    local allowed, local_mode = Gate.syncEntry(self.settings, self:isConfigured())
+    if not allowed then
         if not silent then
-            UIManager:show(InfoMessage:new{ text = _("FNS 同步未启用") })
+            UIManager:show(InfoMessage:new{
+                text = _("已选择 FNS 服务器模式，但服务配置不完整。\n请到 FNS 同步 → 服务设置 填写。"),
+                timeout = 5,
+            })
+        else
+            logger.info("[FNS] sync skipped: FNS mode but service config incomplete")
         end
         return
     end
-    -- M9: 未配置 FNS → 本地模式（笔记写本地文件，无需服务器）。G1 拍板：
-    -- 本地模式仍尊重 enabled 总开关（上面已检查），这里不再拦截。
-    local local_mode = self:_isLocalMode()
     if local_mode then
-        logger.info("[FNS] M9 local mode: sync will write local files")
+        logger.info("[FNS] local mode: sync will write local files")
     end
     local annotations = self.ui and self.ui.annotation
         and self.ui.annotation.annotations or {}
@@ -1996,6 +2019,12 @@ end
 --   intent); auto paths must respect the existing lock.
 function FnsSync:_pullRemoteHighlights(manual)
     logger.info("[FNS] event: _pullRemoteHighlights (" .. (manual and "manual" or "scheduled") .. ")")
+    -- M10: pull is FNS-only by definition — local mode (enabled=false)
+    -- must never pull even with a leftover bidirectional_sync_enabled.
+    if not Gate.pullAllowed(self.settings, self:isConfigured()) then
+        logger.info("[FNS] pull skipped: not in FNS mode or not configured")
+        return
+    end
     if not self.settings.bidirectional_sync_enabled then
         -- Defensive: button is hidden when toggle is off (Day 2b menu), but
         -- pull_on_book_open scheduled task could fire if user toggled off
@@ -2033,17 +2062,17 @@ end
 -- Auto-sync (M5)
 -- ===========================================================================
 
--- Gate check: enabled AND auto_sync_enabled AND (a book is open).
+-- Gate check: auto_sync_enabled AND (a book is open).
 -- Per-event sub-switches are checked by the callers (this only checks
 -- gates shared by both highlight and close paths).
 -- M9 (G5): isConfigured check removed — local mode auto-syncs to local
 -- files too (same UX; a local write is fast and offline-safe). Users who
 -- want no auto-write simply keep auto_sync_enabled off.
+-- M10: enabled check removed too — it is now a MODE switch, not an
+-- on/off switch; both modes auto-write (local md / FNS server).
 function FnsSync:_gateAutoSync()
-    if not self.settings.enabled then return false end
-    if not self.settings.auto_sync_enabled then return false end
-    if not (self.ui and self.ui.annotation) then return false end
-    return true
+    local has_book = (self.ui and self.ui.annotation) ~= nil
+    return Gate.autoSyncAllowed(self.settings, has_book)
 end
 
 --- Reschedule the debounce timer. Unschedules the previous action (if any)
@@ -2075,6 +2104,12 @@ end
 --- highlights to local metadata.lua, so nothing is lost; next open / close /
 --- manual sync catches up when online.
 function FnsSync:_autoSyncCurrentBook()
+    -- M10: FNS mode with incomplete config — skip early and silently,
+    -- instead of running into _triggerSync's guard on every highlight.
+    if not Gate.syncEntry(self.settings, self:isConfigured()) then
+        logger.dbg("[FNS] auto-sync skipped: FNS mode but service config incomplete")
+        return
+    end
     -- M9: 本地模式无需网络，也没有离线队列语义（本地写不产生网络失败）。
     -- 直接走本地同步（silent + skip 网络）。
     if self:_isLocalMode() then
@@ -2579,7 +2614,12 @@ end
 function FnsSync:onOpenDocument()
     logger.info("[FNS] event: onOpenDocument")
     self:_processQueue()
-    if self.settings.bidirectional_sync_enabled and self.settings.pull_on_book_open then
+    -- M10: pull is FNS-only (enabled=true + configured). A leftover
+    -- bidirectional_sync_enabled=true from FNS days must not schedule
+    -- pulls in local mode (plan §3.6.2).
+    if self.settings.pull_on_book_open
+       and self.settings.bidirectional_sync_enabled
+       and Gate.pullAllowed(self.settings, self:isConfigured()) then
         logger.info("[FNS] onOpenDocument: scheduleIn(2s) → _pull_action (bidirectional pull)")
         UIManager:scheduleIn(2, self._pull_action)
     end
@@ -2615,12 +2655,6 @@ function FnsSync:onCloseWidget()
     self._pull_in_flight = false
 end
 
-function FnsSync:onSyncAllHistory()
-    -- TODO M7: walk history dir, batch sync per book, show progress.
-    -- (M6 work is the offline queue above; this is a separate user-triggered
-    -- batch-sync feature for previously-read books.)
-end
-
 -- ===========================================================================
 -- Menu
 -- ===========================================================================
@@ -2631,21 +2665,302 @@ function FnsSync:addToMainMenu(menu_items)
     -- capturing a local would keep pointing at the stale one.
     menu_items.fns_sync = {
         text = _("FNS 同步"),
-        -- Without sorting_hint, KOreader's MenuSorter treats this item as
-        -- orphaned, prepends "NEW: " and dumps it in the first tab — so the
-        -- user can't find it under Tools where they expect it.
+        -- M10: sorting_hint="network" resolves to the Network submenu of
+        -- the settings tab (kosync/wallabag territory) — semantically the
+        -- right home for a server-sync feature. The old "tools" hint put
+        -- us on page 2 behind ~20 built-in entries.
+        sorting_hint = "network",
+        -- Rebuilt per mode on each submenu entry. touchmenu re-evaluates
+        -- sub_item_table_func when ENTERING the submenu; after toggling
+        -- the mode switch the user backs out and re-enters to see the
+        -- other section (KOReader norm, plan §4.1 V1).
+        sub_item_table_func = function() return self:_buildFnsMenu() end,
+    }
+
+    -- M10: AI assistant is an INDEPENDENT module (plan §四) — its own
+    -- top-level entry, fully usable without any FNS configuration.
+    -- Front-of-tools-tab positioning is done by the user-side
+    -- reader_menu_order.lua file (menusorter readMSSettings mechanism);
+    -- sorting_hint alone can only append to a tab's end.
+    menu_items.fns_ai = {
+        text = _("AI 读书助手"),
         sorting_hint = "tools",
         sub_item_table = {
-            -- Master switch
             {
-                text = _("启用 FNS 同步"),
-                checked_func = function() return self.settings.enabled end,
-                callback = function() self:_toggleBool("enabled") end,
+                text = _("启用 AI 对话"),
+                checked_func = function() return self.settings.ai_enabled end,
+                callback = function() self:_toggleBool("ai_enabled") end,
                 separator = true,
             },
-
-            -- Auto-sync (M5)
             {
+                text = _("API 设置"),
+                sub_item_table = {
+                    {
+                        text = _("API 服务 URL"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_api_base",
+                                _("AI API 服务 URL"),
+                                "https://api.deepseek.com/v1")
+                        end,
+                    },
+                    {
+                        text = _("API Key"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_api_key",
+                                _("AI API Key"),
+                                _("sk-...（DeepSeek 或 OpenAI 兼容服务）"))
+                        end,
+                    },
+                    {
+                        text = _("模型名"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_model",
+                                _("AI 模型名"),
+                                "deepseek-chat / gpt-4o-mini / 等")
+                        end,
+                    },
+                },
+                separator = true,
+            },
+            {
+                text = _("提示词模板"),
+                sub_item_table = {
+                    {
+                        text = _("系统提示词"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_system_prompt",
+                                _("系统提示词（送给 AI 的角色设定）"),
+                                _("例如：你是一个阅读助手…"),
+                                true)
+                        end,
+                    },
+                    {
+                        text = _("翻译模板"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_quick_prompts.translate",
+                                _("翻译快捷模板"),
+                                _("可用 {text} 占位符"))
+                        end,
+                    },
+                    {
+                        text = _("解释模板"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_quick_prompts.explain",
+                                _("解释快捷模板"),
+                                _("可用 {text} 占位符"))
+                        end,
+                    },
+                    {
+                        text = _("评论模板"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_quick_prompts.comment",
+                                _("评论快捷模板"),
+                                _("可用 {text} 占位符"))
+                        end,
+                    },
+                    {
+                        text = _("总结模板"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_quick_prompts.summarize",
+                                _("总结快捷模板（让 AI 总结按钮使用）"),
+                                _("例如：请总结以上对话"))
+                        end,
+                    },
+                },
+                separator = true,
+            },
+            {
+                text = _("高级参数"),
+                sub_item_table = {
+                    {
+                        text = _("max_tokens"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_max_tokens",
+                                _("max_tokens"),
+                                "4096")
+                        end,
+                    },
+                    {
+                        text = _("temperature"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_temperature",
+                                _("temperature"),
+                                "0.7")
+                        end,
+                    },
+                    {
+                        text = _("超时（秒）"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_editString("ai_timeout_sec",
+                                _("AI 调用超时（秒）"),
+                                "30")
+                        end,
+                    },
+                },
+            },
+            {
+                text = _("说明"),
+                keep_menu_open = true,
+                callback = function()
+                    UIManager:show(InfoMessage:new{
+                        text = _("AI 读书助手：\n\n1. 在 API 设置里填 base URL + Key + 模型名（DeepSeek 默认）\n2. 长按高亮 → 菜单 → 问 AI\n3. 多轮对话 → 让 AI 总结 → 加入笔记（FNS 模式同步到 Obsidian，离线模式写本地 FNS-Notes/）\n\n提示：API Key 太长不好在 Kindle 上输入？用 USB 连接电脑，编辑 koreader/settings/fns_sync.conf 即可，重启生效。\n\nAPI Key 明文存在 Kindle（跟 FNS Token 同级别），不加密。Kindle 丢失请到 DeepSeek 后台撤销 Key。"),
+                        timeout = 10,
+                    })
+                end,
+            },
+        },
+    }
+end
+
+--- M10: mode-switch toggle — enables FNS server mode; on enabling with
+--- incomplete service config, hint the user instead of failing silently
+--- later (user decision 2026-08-23: auto-detect and prompt on check).
+function FnsSync:_toggleModeSwitch()
+    self:_toggleBool("enabled")
+    if self.settings.enabled and not self:isConfigured() then
+        UIManager:show(InfoMessage:new{
+            text = _("已切换到 FNS 服务器模式，但服务配置不完整。\n请到『服务设置』填写 URL / Token / Vault。"),
+            timeout = 5,
+        })
+    end
+end
+
+--- M10: FNS 同步 menu body — rebuilt on each submenu entry via
+--- sub_item_table_func (plan §4.2). Section visibility follows the mode
+--- switch; after toggling, the user backs out and re-enters to see the
+--- other section (touchmenu limitation, plan §4.1 V1).
+function FnsSync:_buildFnsMenu()
+    -- NOTE: do NOT cache self.settings into a local here either — same
+    -- onResetConfig stale-table concern as addToMainMenu above.
+    local items = {}
+
+    -- Mode switch: FIRST item, visible in both modes.
+    items[#items + 1] = {
+        text = _("FNS 服务器模式"),
+        checked_func = function() return self.settings.enabled end,
+        callback = function() self:_toggleModeSwitch() end,
+        separator = true,
+    }
+
+    if self:_isLocalMode() then
+        -- ── 离线笔记 section (enabled=false) ──
+        -- Plain toggle first (real-device feedback 2026-08-23: a checkbox
+        -- on a submenu entry looks togglable but tapping only enters the
+        -- submenu — user couldn't find any way to enable auto-write).
+        items[#items + 1] = {
+            text = _("自动写本地笔记"),
+            checked_func = function() return self.settings.auto_sync_enabled end,
+            callback = function() self:_toggleBool("auto_sync_enabled") end,
+            separator = true,
+        }
+        items[#items + 1] = {
+            text = _("写入时机"),
+            -- §3.6.1: no `enabled` gate in the offline section —
+            -- enabled=false IS the mode here; auto_sync_enabled is
+            -- the only gate.
+            enabled_func = function() return self.settings.auto_sync_enabled end,
+            sub_item_table = {
+                {
+                    text = _("高亮修改时自动写"),
+                    checked_func = function() return self.settings.sync_on_highlight end,
+                    enabled_func = function() return self.settings.auto_sync_enabled end,
+                    callback = function() self:_toggleBool("sync_on_highlight") end,
+                },
+                {
+                    text = _("关闭书籍时自动写"),
+                    checked_func = function() return self.settings.sync_on_book_close end,
+                    enabled_func = function() return self.settings.auto_sync_enabled end,
+                    callback = function() self:_toggleBool("sync_on_book_close") end,
+                },
+                {
+                    text = _("写入延迟（秒）"),
+                    keep_menu_open = true,
+                    callback = function()
+                        self:_editString("debounce_seconds",
+                            _("写入延迟（秒）"),
+                            _("数字，默认 5"))
+                    end,
+                },
+            },
+            separator = true,
+        }
+        items[#items + 1] = {
+            text = _("本地笔记存储位置"),
+            keep_menu_open = true,
+            callback = function()
+                self:_editString("local_notes_root",
+                    _("本地笔记存储位置"),
+                    _("位于 Kindle 根目录下的文件夹名，默认 FNS-Notes/"))
+            end,
+            separator = true,
+        }
+        items[#items + 1] = {
+            -- M10 §3.6.3: NO enabled gate — zero-threshold manual sync.
+            text = _("同步到本地笔记"),
+            callback = function() self:onSyncCurrentBook() end,
+        }
+        items[#items + 1] = {
+            text = _("查看本地本书笔记"),
+            callback = function() self:onViewLocalNote() end,
+        }
+    else
+        -- ── FNS 服务器 section (enabled=true) ──
+        items[#items + 1] = {
+            text = _("服务设置"),
+            sub_item_table = {
+                {
+                    text = _("FNS 服务 URL"),
+                    keep_menu_open = true,
+                    callback = function()
+                        self:_editString("server_url",
+                            _("FNS 服务 URL"),
+                            "https://fns.example.com")
+                    end,
+                },
+                {
+                    text = _("API Token"),
+                    keep_menu_open = true,
+                    callback = function()
+                        self:_editString("api_token",
+                            _("API Token"),
+                            _("粘贴 FNS 服务生成的 Token"))
+                    end,
+                },
+                {
+                    text = _("Vault 名"),
+                    keep_menu_open = true,
+                    callback = function()
+                        self:_editString("vault",
+                            _("Vault 名"),
+                            _("Obsidian Vault 名称"))
+                    end,
+                },
+                {
+                    text = _("测试连接"),
+                    enabled_func = function() return self:isConfigured() end,
+                    callback = function() self:onTestConnection() end,
+                },
+            },
+            separator = true,
+        }
+        items[#items + 1] = {
+            text = _("立即同步当前书"),
+            callback = function() self:onSyncCurrentBook() end,
+            separator = true,
+        }
+        -- Auto-sync (M5) + bidirectional (M7) subtree, FNS-mode gating
+        items[#items + 1] = {
                 text = _("自动同步"),
                 checked_func = function() return self.settings.auto_sync_enabled end,
                 sub_item_table = {
@@ -2660,8 +2975,7 @@ function FnsSync:addToMainMenu(menu_items)
                         checked_func = function() return self.settings.sync_on_highlight end,
                         -- M9 G5: local mode auto-syncs too — no isConfigured gate
                         enabled_func = function()
-                            return self.settings.enabled
-                               and self.settings.auto_sync_enabled
+                            return self.settings.auto_sync_enabled
                         end,
                         callback = function() self:_toggleBool("sync_on_highlight") end,
                     },
@@ -2669,8 +2983,7 @@ function FnsSync:addToMainMenu(menu_items)
                         text = _("关闭书籍时同步"),
                         checked_func = function() return self.settings.sync_on_book_close end,
                         enabled_func = function()
-                            return self.settings.enabled
-                               and self.settings.auto_sync_enabled
+                            return self.settings.auto_sync_enabled
                         end,
                         callback = function() self:_toggleBool("sync_on_book_close") end,
                     },
@@ -2688,8 +3001,7 @@ function FnsSync:addToMainMenu(menu_items)
                         text = _("双向同步（实验性）"),
                         checked_func = function() return self.settings.bidirectional_sync_enabled end,
                         enabled_func = function()
-                            return self.settings.enabled
-                               and self.settings.auto_sync_enabled
+                            return self.settings.auto_sync_enabled
                                and self:isConfigured()
                         end,
                         sub_item_table = {
@@ -2697,8 +3009,7 @@ function FnsSync:addToMainMenu(menu_items)
                                 text = _("启用双向同步"),
                                 checked_func = function() return self.settings.bidirectional_sync_enabled end,
                                 enabled_func = function()
-                                    return self.settings.enabled
-                                       and self.settings.auto_sync_enabled
+                                    return self.settings.auto_sync_enabled
                                        and self:isConfigured()
                                 end,
                                 callback = function() self:_toggleBidirectionalSync() end,
@@ -2707,8 +3018,7 @@ function FnsSync:addToMainMenu(menu_items)
                                 text = _("开书时自动拉取"),
                                 checked_func = function() return self.settings.pull_on_book_open end,
                                 enabled_func = function()
-                                    return self.settings.enabled
-                                       and self.settings.auto_sync_enabled
+                                    return self.settings.auto_sync_enabled
                                        and self:isConfigured()
                                        and self.settings.bidirectional_sync_enabled
                                 end,
@@ -2728,10 +3038,19 @@ function FnsSync:addToMainMenu(menu_items)
                     },
                 },
                 separator = true,
-            },
+        }
 
-            -- Offline queue (M6)
-            {
+        items[#items + 1] = {
+            text = _("立即拉取远端高亮"),
+            enabled_func = function()
+                return self:isConfigured()
+                   and self.settings.bidirectional_sync_enabled
+            end,
+            callback = function() self:_pullRemoteHighlights(true) end,
+            separator = true,
+        }
+        -- Offline queue (M6)
+        items[#items + 1] = {
                 -- H-4 fix (review): dynamic text reflects token-failure state.
                 -- If any entry is frozen, prefix [!] so user knows to check.
                 text_func = function()
@@ -2846,202 +3165,12 @@ function FnsSync:addToMainMenu(menu_items)
                     },
                 },
                 separator = true,
-            },
+        }
+    end
 
-            -- Actions
-            {
-                -- M9: 本地模式（未配置 FNS）按钮照样可用，文案切换提示
-                -- 笔记去向（G1：尊重 enabled 总开关）。
-                text_func = function()
-                    if self:_isLocalMode() then
-                        return _("同步到本地笔记")
-                    end
-                    return _("立即同步当前书")
-                end,
-                enabled_func = function()
-                    return self.settings.enabled
-                end,
-                callback = function() self:onSyncCurrentBook() end,
-            },
-            -- M9 (D3): view the local note file for the current book
-            {
-                text = _("查看本地笔记"),
-                enabled_func = function()
-                    return self.settings.enabled
-                end,
-                callback = function() self:onViewLocalNote() end,
-            },
-            -- M7: manual pull button. Visible always, enabled only when
-            -- bidirectional_sync_enabled is on (greyed out otherwise as a
-            -- discoverability hint that the feature exists).
-            {
-                text = _("立即拉取远端高亮"),
-                enabled_func = function()
-                    return self.settings.enabled
-                       and self:isConfigured()
-                       and self.settings.bidirectional_sync_enabled
-                end,
-                callback = function() self:_pullRemoteHighlights(true) end,
-            },
-            {
-                text = _("立即同步全部历史"),
-                enabled_func = function()
-                    return false  -- TODO M6
-                end,
-                callback = function() self:onSyncAllHistory() end,
-            },
-            -- M8: AI assistant menu subtree (independent of FNS enabled).
-            -- NO enabled_func here: gating the subtree on ai_enabled would
-            -- deadlock — the toggle that enables ai_enabled lives INSIDE this
-            -- subtree, so a disabled entry could never be opened (user was
-            -- forced to hand-edit settings.reader.lua; diagnosed 2026-08-23).
-            {
-                text = _("AI 助手"),
-                sub_item_table = {
-                    {
-                        text = _("启用 AI 对话"),
-                        checked_func = function() return self.settings.ai_enabled end,
-                        callback = function() self:_toggleBool("ai_enabled") end,
-                        separator = true,
-                    },
-                    {
-                        text = _("API 设置"),
-                        sub_item_table = {
-                            {
-                                text = _("API 服务 URL"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_api_base",
-                                        _("AI API 服务 URL"),
-                                        "https://api.deepseek.com/v1")
-                                end,
-                            },
-                            {
-                                text = _("API Key"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_api_key",
-                                        _("AI API Key"),
-                                        _("sk-...（DeepSeek 或 OpenAI 兼容服务）"))
-                                end,
-                            },
-                            {
-                                text = _("模型名"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_model",
-                                        _("AI 模型名"),
-                                        "deepseek-chat / gpt-4o-mini / 等")
-                                end,
-                            },
-                        },
-                        separator = true,
-                    },
-                    {
-                        text = _("提示词模板"),
-                        sub_item_table = {
-                            {
-                                text = _("系统提示词"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_system_prompt",
-                                        _("系统提示词（送给 AI 的角色设定）"),
-                                        _("例如：你是一个阅读助手…"),
-                                        true)
-                                end,
-                            },
-                            {
-                                text = _("翻译模板"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_quick_prompts.translate",
-                                        _("翻译快捷模板"),
-                                        _("可用 {text} 占位符"))
-                                end,
-                            },
-                            {
-                                text = _("解释模板"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_quick_prompts.explain",
-                                        _("解释快捷模板"),
-                                        _("可用 {text} 占位符"))
-                                end,
-                            },
-                            {
-                                text = _("评论模板"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_quick_prompts.comment",
-                                        _("评论快捷模板"),
-                                        _("可用 {text} 占位符"))
-                                end,
-                            },
-                            {
-                                text = _("总结模板"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_quick_prompts.summarize",
-                                        _("总结快捷模板（让 AI 总结按钮使用）"),
-                                        _("例如：请总结以上对话"))
-                                end,
-                            },
-                        },
-                        separator = true,
-                    },
-                    {
-                        text = _("高级参数"),
-                        sub_item_table = {
-                            {
-                                text = _("max_tokens"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_max_tokens",
-                                        _("max_tokens"),
-                                        "4096")
-                                end,
-                            },
-                            {
-                                text = _("temperature"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_temperature",
-                                        _("temperature"),
-                                        "0.7")
-                                end,
-                            },
-                            {
-                                text = _("超时（秒）"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("ai_timeout_sec",
-                                        _("AI 调用超时（秒）"),
-                                        "30")
-                                end,
-                            },
-                        },
-                    },
-                    {
-                        text = _("说明"),
-                        keep_menu_open = true,
-                        callback = function()
-                            UIManager:show(InfoMessage:new{
-                                text = _("AI 助手（M8）：\n\n1. 在 API 设置里填 base URL + Key + 模型名（DeepSeek 默认）\n2. 长按高亮 → 菜单 → 问 AI\n3. 多轮对话 → 让 AI 总结 → 加到笔记（同步到 Obsidian）\n\nAPI Key 明文存在 Kindle（跟 FNS Token 同级别），不加密。Kindle 丢失请到 DeepSeek 后台撤销 Key。"),
-                                timeout = 10,
-                            })
-                        end,
-                    },
-                },
-                separator = true,
-            },
-            {
-                text = _("测试连接"),
-                enabled_func = function() return self:isConfigured() end,
-                callback = function() self:onTestConnection() end,
-            },
-
-            -- Per-book title/author override
-            {
+    -- ── 共用 section (both modes) ──
+    -- Per-book title/author override
+    items[#items + 1] = {
                 text = _("当前书信息"),
                 enabled_func = function() return self:_getCurrentBookPath() ~= nil end,
                 sub_item_table = {
@@ -3086,51 +3215,13 @@ function FnsSync:addToMainMenu(menu_items)
                     },
                 },
                 separator = true,
-            },
+        }
 
-            -- Settings root
-            {
-                text = _("设置"),
+    -- Note organization (M10: lifted out of the old "设置" wrapper; service
+    -- connection now lives in the FNS section, trigger mode in 自动同步)
+    items[#items + 1] = {
+                text = _("笔记组织"),
                 sub_item_table = {
-                    -- Service connection
-                    {
-                        text = _("服务连接"),
-                        sub_item_table = {
-                            {
-                                text = _("FNS 服务 URL"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("server_url",
-                                        _("FNS 服务 URL"),
-                                        "https://fns.example.com")
-                                end,
-                            },
-                            {
-                                text = _("API Token"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("api_token",
-                                        _("API Token"),
-                                        _("粘贴 FNS 服务生成的 Token"))
-                                end,
-                            },
-                            {
-                                text = _("Vault 名"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("vault",
-                                        _("Vault 名"),
-                                        _("Obsidian Vault 名称"))
-                                end,
-                            },
-                        },
-                        separator = true,
-                    },
-
-                    -- Note organization
-                    {
-                        text = _("笔记组织"),
-                        sub_item_table = {
                             {
                                 text = _("笔记路径前缀"),
                                 keep_menu_open = true,
@@ -3160,13 +3251,13 @@ function FnsSync:addToMainMenu(menu_items)
                                 end,
                             },
                         },
-                        separator = true,
-                    },
+                separator = true,
+    }
 
-                    -- Excerpt rendering
-                    {
-                        text = _("摘录渲染"),
-                        sub_item_table = {
+    -- Excerpt rendering
+    items[#items + 1] = {
+                text = _("摘录渲染"),
+                sub_item_table = {
                             {
                                 text = _("显示页码"),
                                 checked_func = function() return self.settings.show_page_number end,
@@ -3199,45 +3290,12 @@ function FnsSync:addToMainMenu(menu_items)
                                 separator = true,
                             },
                         },
-                        separator = true,
-                    },
+    }
 
-                    -- Trigger mode
-                    {
-                        text = _("触发模式"),
-                        sub_item_table = {
-                            {
-                                text = _("高亮即同步"),
-                                checked_func = function() return self.settings.sync_on_highlight end,
-                                callback = function() self:_toggleBool("sync_on_highlight") end,
-                            },
-                            -- "开书同步" toggle removed in v4: was M5 placeholder
-                            -- referencing sync_on_book_open, which is now
-                            -- pull_on_book_open and lives under
-                            -- 自动同步 → 双向同步（实验性） → 开书时自动拉取.
-                            {
-                                text = _("关书同步"),
-                                checked_func = function() return self.settings.sync_on_book_close end,
-                                callback = function() self:_toggleBool("sync_on_book_close") end,
-                            },
-                            {
-                                text = _("防抖延迟（秒）"),
-                                keep_menu_open = true,
-                                callback = function()
-                                    self:_editString("debounce_seconds",
-                                        _("防抖延迟（秒）"),
-                                        tostring(Config.DEFAULTS.debounce_seconds))
-                                end,
-                                separator = true,
-                            },
-                        },
-                        separator = true,
-                    },
-
-                    -- Advanced
-                    {
-                        text = _("高级"),
-                        sub_item_table = {
+    -- Advanced
+    items[#items + 1] = {
+                text = _("高级"),
+                sub_item_table = {
                             {
                                 text = _("重置配置"),
                                 keep_menu_open = true,
@@ -3248,17 +3306,16 @@ function FnsSync:addToMainMenu(menu_items)
                                 keep_menu_open = true,
                                 callback = function()
                                     UIManager:show(InfoMessage:new{
-                                        text = T(_("FNS Sync\n\nKOreader 高亮/笔记同步到 Obsidian（通过 Fast Note Sync 服务）\n\n状态：%1"),
-                                            self.settings.enabled and _("已启用") or _("未启用")),
+                                        text = T(_("FNS Sync\n\n高亮/笔记 → Obsidian（FNS 服务）或本地笔记（%1）\n\n当前模式：%2"),
+                                            self.settings.local_notes_root or "FNS-Notes/",
+                                            self:_isLocalMode() and _("离线本地笔记") or _("FNS 服务器同步")),
                                     })
                                 end,
                             },
                         },
-                    },
-                },
-            },
-        },
     }
+
+    return items
 end
 
 return FnsSync

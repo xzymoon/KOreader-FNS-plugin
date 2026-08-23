@@ -442,7 +442,9 @@ end
 -- @param segments list  parsed segments (NOT modified)
 -- @param book_path string  current book file path
 -- @return drained_list, new_segments
---   drained_list: pending block references that were merged (caller commits these)
+--   drained_list: pending block references that were merged OR dropped
+--     (caller commits these either way — dropped ones must leave pending
+--     too, or they'd re-drain forever; 2026-08-23 decision)
 --   new_segments: copy of segments with AI@ blocks inserted
 function Marker.drainAiBlocks(pending_blocks, segments, book_path)
     if not pending_blocks or #pending_blocks == 0 then
@@ -477,20 +479,23 @@ function Marker.drainAiBlocks(pending_blocks, segments, book_path)
                 end
             end
 
-            local insert_idx
             if hl_idx then
                 local last_idx = last_idx_by_hl_ts[pending.hl_ts] or hl_idx
-                insert_idx = last_idx + 1
+                local insert_idx = last_idx + 1
+                table.insert(new_segments, insert_idx, ai_seg)
+                last_idx_by_hl_ts[pending.hl_ts] = insert_idx
+                logger.info(("[FNS] merging AI@ ts=%s at segment %d"):format(pending.ts, insert_idx))
             else
-                -- LOW-4 fix: no matching HL@, append at end + mark orphaned
-                insert_idx = #new_segments + 1
-                ai_meta.orphaned = "true"
-                logger.warn(("[FNS] no matching HL@ for AI@ ts=%s hl_ts=%s, appending at end (orphaned)"):format(
+                -- 2026-08-23 user decision (M10 real-device test): host HL@
+                -- gone → DROP the pending AI@ block. The old LOW-4 behavior
+                -- (orphaned append at end) resurrected AI answers for
+                -- highlights the user had already deleted, and orphaned
+                -- blocks are never cascade-cleaned afterwards. Dropped
+                -- blocks still go into `drained` so the caller's commit
+                -- removes them from pending (no infinite re-drain).
+                logger.info(("[FNS] no matching HL@ for AI@ ts=%s hl_ts=%s, dropping (host highlight deleted)"):format(
                     pending.ts, tostring(pending.hl_ts)))
             end
-            table.insert(new_segments, insert_idx, ai_seg)
-            last_idx_by_hl_ts[pending.hl_ts] = insert_idx
-            logger.info(("[FNS] merging AI@ ts=%s at segment %d"):format(pending.ts, insert_idx))
             table.insert(drained, pending)
         end
     end

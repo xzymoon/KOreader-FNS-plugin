@@ -225,7 +225,11 @@ do
     check("drain: original segments NOT modified", #segs == 2)
 end
 
--- 14. drainAiBlocks: no matching HL@ → orphaned fallback append at end
+-- 14. drainAiBlocks: no matching HL@ → DROP the block (2026-08-23 user
+-- decision: host highlight deleted means the AI answer goes too; the old
+-- orphaned-append resurrected answers for deleted highlights and was
+-- never cascade-cleaned). Dropped block still enters `drained` so the
+-- caller's commit removes it from pending (no infinite re-drain).
 do
     local pending = {
         { ts = "ai-ts1", hl_ts = "missing-hl", content = "AI 内容",
@@ -235,9 +239,9 @@ do
         { type = "hl", ts = "hl-ts1", content = "原文" },
     }
     local drained, new_segs = Marker.drainAiBlocks(pending, segs, "/book.epub")
-    check("drain: orphaned drained", #drained == 1)
-    check("drain: orphaned appended at end", new_segs[2].type == "ai")
-    check("drain: orphaned has orphaned=true meta", new_segs[2].meta.orphaned == "true")
+    check("drain: dropped block enters drained (commit clears pending)", #drained == 1)
+    check("drain: dropped block NOT appended to segments", #new_segs == 1)
+    check("drain: remaining segment is the HL@", new_segs[1].type == "hl")
 end
 
 -- 15. drainAiBlocks: H-4 fix — multiple AI@ for same HL@ preserve enqueue order
@@ -401,7 +405,9 @@ do
 end
 
 -- 25. cascade after drain (integration): pending AI whose host HL was just
--- deleted must NOT come back as orphaned — cascade runs after drain.
+-- deleted is dropped by drain itself (2026-08-23 decision); cascade is a
+-- no-op afterwards. This test guards the composition either way: nothing
+-- belonging to the deleted host may survive into the note.
 do
     local pending = {
         { ts = "ai-1", hl_ts = "hl-1", content = "宿主已删的 pending 回答",
@@ -410,9 +416,9 @@ do
     -- applyDiff already removed hl-1; segments now only hold another HL
     local segs = { { type = "hl", ts = "hl-2", content = "别的摘录" } }
     local _, drained_segs = Marker.drainAiBlocks(pending, segs, "/b")
-    -- drain appends ai-1 as orphaned at end; cascade must remove it
+    -- drain drops ai-1 (host gone); cascade has nothing left to remove
     local out = Marker.cascadeDeleteAi(drained_segs, { "hl-1" })
-    check("drain+cascade: orphaned AI for deleted host removed", #out == 1)
+    check("drain+cascade: AI for deleted host removed", #out == 1)
     check("drain+cascade: only the other HL remains", out[1].ts == "hl-2")
 end
 
