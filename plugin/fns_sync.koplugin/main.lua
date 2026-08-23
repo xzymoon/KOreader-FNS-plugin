@@ -1204,16 +1204,23 @@ function FnsSync:_triggerSync(opts)
     end
     local annotations = self.ui and self.ui.annotation
         and self.ui.annotation.annotations or {}
-    -- Bidirectional path (M7): allow empty annotations — first-time pull
-    -- after enabling the toggle legitimately has zero local highlights
-    -- (entire round is server → local). Only short-circuit when push-only.
-    -- M9: local mode has no remote to pull from → always push-only here,
-    -- even if bidirectional_sync_enabled is a leftover true from FNS days.
-    if #annotations == 0 and (local_mode or not self.settings.bidirectional_sync_enabled) then
-        if not silent then
-            UIManager:show(InfoMessage:new{ text = _("当前书没有高亮/笔记") })
+    -- Empty-annotations policy (rewritten 2026-08-23 after a real-device
+    -- bug: deleting the LAST highlight left all blocks lingering in the
+    -- local md, because the old guard skipped empty syncs unconditionally):
+    --   local mode (manual OR auto) → fall through & clear the md
+    --     (low risk: highlights persist in metadata.lua; re-sync rebuilds)
+    --   FNS manual → hint & skip (one tap must not wipe the server note)
+    --   FNS auto, push-only → silent skip (same wipe risk)
+    --   FNS auto, bidirectional → fall through (M7 first-time pull: the
+    --     entire round is server → local, zero local highlights is legit)
+    if #annotations == 0 and not local_mode then
+        local bidir_auto_pull = silent and self.settings.bidirectional_sync_enabled
+        if not bidir_auto_pull then
+            if not silent then
+                UIManager:show(InfoMessage:new{ text = _("当前书没有高亮/笔记") })
+            end
+            return
         end
-        return
     end
 
     local meta = self:_getBookMetadata()
@@ -1339,12 +1346,17 @@ function FnsSync:_doSyncCurrentBookLegacy(annotations, meta, path, silent, store
     -- addition is backward-compatible. M6 caller (_processQueueItem) inspects
     -- the result to advance attempts / detect token failure / drop entry.
 
-    -- M6 review fix (E failure defense): refuse to sync empty annotations.
-    -- Without this guard, Marker.diff(segments, {}) would mark ALL existing
+    -- M6 review fix (E failure defense): refuse to PUSH empty annotations
+    -- to the FNS server — Marker.diff(segments, {}) would mark ALL existing
     -- HL@ blocks for deletion → wipe the user's Obsidian note. The M5 path
     -- is protected by _triggerSync's pre-check, but the M6 queue path
     -- bypasses _triggerSync, so we guard here too.
-    if annotations == nil or #annotations == 0 then
+    -- M10 fix (2026-08-23): LOCAL mode is exempt — deleting the LAST
+    -- highlight must clear the local md's blocks (real-device bug: blocks
+    -- lingered in FNS-Notes/). Local wipes are recoverable (metadata.lua
+    -- keeps the highlights; re-sync rebuilds), server wipes are not.
+    local is_local_store = (store == LocalStore)
+    if annotations == nil or (#annotations == 0 and not is_local_store) then
         if not silent then
             UIManager:show(InfoMessage:new{ text = _("当前书没有高亮/笔记"), timeout = 2 })
         end
