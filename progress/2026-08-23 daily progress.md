@@ -70,3 +70,11 @@
 - 离线区新 toggle 结构（自动写本地笔记开 → 高亮 5 秒自动写）
 - 工具 tab 首位出现 AI 读书助手（menu_order 生效）
 - （可选）删除高亮 → 手动同步 → 对应 AI@ 一起消失（drop 逻辑）
+
+## 二轮真机验证（21:07-21:09）：全部通过，M10 闭环
+
+1. 工具 tab 首位出现 AI 读书助手（menu_order 生效）✓
+2. 离线区纯 toggle 勾选"自动写本地笔记"后，高亮/删除事件 5 秒自动写本地 md ✓
+   ——日志证据：`21:08:15 onAnnotationsModified(hl_added=-1) → 21:08:20 sync start (auto)`
+3. 删除带 AI 回答的高亮 → 同步后 HL@ 与 AI@ 一起消失 ✓
+   ——日志证据：`deleting AI@ ts=21:07:34 (cascade from HL@21:06:22)`；笔记文件仅剩配对块
