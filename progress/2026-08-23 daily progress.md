@@ -100,3 +100,9 @@
 - **审查**：方案阶段 3 轮子代理审查（KOReader 源码契合 ×2 + 插件逻辑 ×2 + conf 机制 ×2），代码阶段 2 个子代理复审，发现并修复 2 致命（模板自导入/白名单类型）+ 多项重要
 - **真机验证**：两台 Kindle 三轮（离线模式两轮 + FNS 服务器模式一轮），全链路通过；两台均已部署 M10 最终版
 - **遗留事项**：① KOReader OTA 升级后 tools 列表若变化，需重新生成 reader_menu_order.lua；② 种子上传（.uploaded.bak）场景待自然验证——需"服务器无此书笔记 + 本地已有 md"前提，留给日常使用中遇到（逻辑已由 M9 单测覆盖）；③ automem-memory.txt / claude-debug-log.txt 为会话文件，保持不提交
+
+## 收尾：README 全面更新 + GitHub 推送（ec7327e）
+
+- README.md / README.en.md 重写至 M10：双模式简介、功能三分区（笔记同步/AI 助手/conf）、新菜单树、conf 配置方式、FNS 服务端改为可选、隐私章节路径更新
+- 新增 `extras/reader_menu_order.lua`（安装可选步骤：AI 入口钉工具 tab 首位）
+- 推送 170e174..ec7327e（M9 4 个 + 本日 6 个提交）
