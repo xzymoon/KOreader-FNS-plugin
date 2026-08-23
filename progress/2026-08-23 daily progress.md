@@ -106,3 +106,9 @@
 - README.md / README.en.md 重写至 M10：双模式简介、功能三分区（笔记同步/AI 助手/conf）、新菜单树、conf 配置方式、FNS 服务端改为可选、隐私章节路径更新
 - 新增 `extras/reader_menu_order.lua`（安装可选步骤：AI 入口钉工具 tab 首位）
 - 推送 170e174..ec7327e（M9 4 个 + 本日 6 个提交）
+
+## 收尾：Release 体系修正（v1.2.0 发布 + 旧版补附件）
+
+- 发现旧 release 无自定义附件（用户看到的"整项目打包"是 GitHub 自动 Source code 链接，平台标配不可移除）
+- v1.2.0 发布（M10）：附件 fns_sync-v1.2.0.zip = fns_sync.koplugin/ + reader_menu_order.lua + INSTALL.txt（81.8K）
+- v1.1.0 / v1.0.0：从对应 git tag 检出插件代码分别打包补传（70.8K / 37.0K），下载即用
