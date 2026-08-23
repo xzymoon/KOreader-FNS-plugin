@@ -42,7 +42,7 @@
 
 ---
 
-# M10 菜单重设计 + conf 电脑端导入（当日主体工作）
+## M10 菜单重设计 + conf 电脑端导入（当日主体工作）
 
 方案文档：`docs/superpowers/plans/2026-08-23-m10-menu-redesign.md`（v4，三轮子代理审查全过：菜单机制源码验证 ×2 + gating 逻辑 ×2 + conf 机制 ×2）。
 
@@ -65,7 +65,7 @@
 
 全部 8 个插件文件 + menu_order 已部署 H:\koreader（diff 验证一致）；测试 230 项全过（原 167 基线 + gate 20 + conf 43）。
 
-## 二轮真机待验证
+## 二轮真机待验证（清单，结果见下节）
 
 - 离线区新 toggle 结构（自动写本地笔记开 → 高亮 5 秒自动写）
 - 工具 tab 首位出现 AI 读书助手（menu_order 生效）
@@ -78,3 +78,11 @@
    ——日志证据：`21:08:15 onAnnotationsModified(hl_added=-1) → 21:08:20 sync start (auto)`
 3. 删除带 AI 回答的高亮 → 同步后 HL@ 与 AI@ 一起消失 ✓
    ——日志证据：`deleting AI@ ts=21:07:34 (cascade from HL@21:06:22)`；笔记文件仅剩配对块
+
+## 当日总结
+
+- **3 个提交**：2be6bb6（AI 菜单死锁修复）→ a0c0505（M10 主体，+1246/-349）→ 55609d7（二轮验证记录）
+- **测试基线**：167 → 230 项（新增 gate 20 + conf 43），全过
+- **审查**：方案阶段 3 轮子代理审查（KOReader 源码契合 ×2 + 插件逻辑 ×2 + conf 机制 ×2），代码阶段 2 个子代理复审，发现并修复 2 致命（模板自导入/白名单类型）+ 多项重要
+- **Kindle 状态**：全部插件文件与仓库一致，menu_order 已生成，conf 模板已自动生成；用户进入日常使用
+- **遗留事项**：① KOReader OTA 升级后 tools 列表若变化，需重新生成 reader_menu_order.lua；② FNS 服务器模式真机验证未做（用户暂无 FNS 服务器，逻辑已由单测覆盖）；③ automem-memory.txt / claude-debug-log.txt 为会话文件，保持不提交
