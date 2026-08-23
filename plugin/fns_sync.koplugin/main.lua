@@ -2890,10 +2890,13 @@ function FnsSync:addToMainMenu(menu_items)
                 end,
                 callback = function() self:onSyncAllHistory() end,
             },
-            -- M8: AI assistant menu subtree (independent of FNS enabled)
+            -- M8: AI assistant menu subtree (independent of FNS enabled).
+            -- NO enabled_func here: gating the subtree on ai_enabled would
+            -- deadlock — the toggle that enables ai_enabled lives INSIDE this
+            -- subtree, so a disabled entry could never be opened (user was
+            -- forced to hand-edit settings.reader.lua; diagnosed 2026-08-23).
             {
                 text = _("AI 助手"),
-                enabled_func = function() return self.settings.ai_enabled == true end,
                 sub_item_table = {
                     {
                         text = _("启用 AI 对话"),
