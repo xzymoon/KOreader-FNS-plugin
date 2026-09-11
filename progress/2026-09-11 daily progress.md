@@ -101,3 +101,14 @@ Lua 源码无 license header（沿用现状，不加）。
 - 附件：v1.2.1.zip
 - https://github.com/xzymoon/KOreader-FNS-plugin/releases/tag/v1.2.1
 
+## README 补充 reader_menu_order.lua 的机制说明
+
+### 背景
+
+用户问"reader_menu_order.lua 为什么在插件文件夹外、是做什么的"。排查发现 README 安装步骤第 3 步只写了"做什么/装哪/可选"，没写"为什么必须在 settings/ 而非插件目录"（KOReader 用户级菜单排序覆盖机制、插件无法自控菜单位置、OTA 后需重新生成）——这些只存在于文件头注释。
+
+### 改动
+
+- `README.md` / `README.en.md` 安装步骤 3 各加一条子项：说明它是 KOReader 用户级菜单排序文件、KOReader 只从 `settings/` 读取、插件无法自行控制菜单位置，并链接到文件头注释（OTA 注意事项留在文件注释，不展开进 README）
+- 纯文档改动，不影响 v1.2.1 附件（包内 README 为发版时快照，此差异属正常）
+

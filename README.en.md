@@ -36,6 +36,7 @@ API keys too long for the on-device keyboard? Edit `koreader/settings/fns_sync.c
    - **Kindle**: USB-connect, then copy to `<KINDLE>:/koreader/plugins/fns_sync.koplugin/`
    - **Other devices** (Android / Desktop / etc.): see the KOReader docs for the plugin path
 3. (Optional, recommended) Copy `extras/reader_menu_order.lua` to `<KINDLE>:/koreader/settings/` — pins "AI Reading Assistant" to the **top** of the Tools tab (without it the entry sits at the tab's end; functionality is unaffected)
+   - This is a KOReader user-level menu-order file; KOReader only reads it from `settings/` (a plugin cannot control its own menu position), which is why it doesn't live inside the plugin directory — see the [file header comments](./extras/reader_menu_order.lua) for how it works and what to do after a KOReader OTA upgrade
 4. Restart KOreader
 
 ## Menu Structure

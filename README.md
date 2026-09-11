@@ -36,6 +36,7 @@ API Key 太长、Kindle 键盘难输入？连接 USB 编辑 `koreader/settings/f
    - **Kindle**：USB 连接后拷贝到 `<KINDLE>:/koreader/plugins/fns_sync.koplugin/`
    - **其他设备**（Android / Desktop / 等）：参考 KOreader 文档的插件路径
 3. （可选，推荐）复制 `extras/reader_menu_order.lua` 到 `<KINDLE>:/koreader/settings/`——把"AI 读书助手"钉在工具 tab **第一位**（不复制则排在工具 tab 末尾，功能不受影响）
+   - 这是 KOReader 的用户级菜单排序文件，KOReader 只从 `settings/` 读取它（插件无法自行控制菜单位置），因此不在插件目录内；作用机制与 OTA 升级后的更新方法见[文件头注释](./extras/reader_menu_order.lua)
 4. 重启 KOreader
 
 ## 菜单结构
