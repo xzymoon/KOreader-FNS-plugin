@@ -168,7 +168,6 @@ KOreader 里的高亮在 Obsidian 端被包裹成 HL@ 块。
 ## 赞助
 
 如果这个插件对你有帮助，欢迎请作者喝杯咖啡：
-[![Donate](https://img.shields.io/badge/PayPal-Donate-blue.svg?logo=paypal)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=WTV8HNRMMMGEC)
 
 <p align="center">
   <img src="./docs/sponsor-wechat.jpg" width="220" alt="微信赞助二维码" />

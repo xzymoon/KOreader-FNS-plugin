@@ -168,7 +168,6 @@ Queue data (book path + title) is stored in the `fns_sync_queue` field of KOread
 ## Sponsor
 
 If this plugin helps you, consider buying the author a coffee:
-[![Donate](https://img.shields.io/badge/PayPal-Donate-blue.svg?logo=paypal)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=WTV8HNRMMMGEC)
 
 <p align="center">
   <img src="./docs/sponsor-wechat.jpg" width="220" alt="WeChat sponsor QR code" />
