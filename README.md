@@ -175,4 +175,6 @@ KOreader 里的高亮在 Obsidian 端被包裹成 HL@ 块。
 
 ## License
 
+Copyright © 2026 xzymoon
+
 [AGPL-3.0](./LICENSE)，与 KOreader 本体一致。任何人可自由使用、修改、分发（包括商业用途），但修改后的版本必须以相同协议开源。

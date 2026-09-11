@@ -175,4 +175,6 @@ If this plugin helps you, consider buying the author a coffee:
 
 ## License
 
+Copyright © 2026 xzymoon
+
 [AGPL-3.0](./LICENSE), same as KOreader itself. You are free to use, modify, and distribute it (including commercially), provided modified versions are released under the same license.

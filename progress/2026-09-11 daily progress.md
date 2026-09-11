@@ -67,3 +67,13 @@ Lua 源码无 license header（沿用现状，不加）。
 - `grep -rin polyform README.md README.en.md plugin/ .github/` 无匹配。
 - 推送后核对 GitHub 页面 License 标签与 README License 章节。
 
+### 追加修正：LICENSE 改纯净全文，让 GitHub 正确识别
+
+首版 LICENSE 在官方全文顶部加了自定义版权头，导致 GitHub licensee 检测失败（API 返回 `"key": "other", "spdx_id": "NOASSERTION"`，About 区会显示 "Other" 而非 AGPL-3.0）。
+
+修法（与 KOReader 本体仓库一致的主流做法）：
+
+- `LICENSE`：替换为 GNU 官方 `agpl-3.0.txt` 纯净全文（661 行，md5 与官方下载逐字节一致）
+- 版权声明 `Copyright © 2026 xzymoon` 移到 `README.md` / `README.en.md` 的 License 章节
+- 推送后 GitHub API license 字段应变为 `agpl-3.0`
+
