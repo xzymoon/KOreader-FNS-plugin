@@ -173,12 +173,6 @@ If this plugin helps you, consider buying the author a coffee:
   <img src="./docs/sponsor-wechat.jpg" width="220" alt="WeChat sponsor QR code" />
 </p>
 
-## Commercial Licensing
-
-This project is licensed under the PolyForm Noncommercial License 1.0.0 — personal study, research, teaching, charity and religious use are permitted.
-
-**Commercial use requires separate authorization.** Contact the author via a [GitHub Issue](https://github.com/xzymoon/KOreader-FNS-plugin/issues/new).
-
 ## License
 
-[PolyForm Noncommercial 1.0.0](./LICENSE)
+[AGPL-3.0](./LICENSE), same as KOreader itself. You are free to use, modify, and distribute it (including commercially), provided modified versions are released under the same license.

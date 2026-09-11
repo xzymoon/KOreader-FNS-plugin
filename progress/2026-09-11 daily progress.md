@@ -26,3 +26,44 @@
 
 - `grep -ri paypal README.md README.en.md .github/` 无匹配。
 - 推送到 GitHub 后检查仓库页面：README 无 PayPal 徽章、About 区无 Sponsor 按钮。
+
+## License 切换：PolyForm Noncommercial 1.0.0 → AGPL-3.0
+
+### 背景
+
+用户觉得现 license"有点问题"，提议换 AGPL-3.0。排查确认了一个真实存在的合规瑕疵：
+
+- **KOreader 本体是 AGPL-3.0**，本插件 `require` 了 20+ 个 KOreader 源码模块（`ui/widget/*`、`ui/uimanager`、`ui/network/manager`、`docsettings`、`socketutil`、`libs/libkoreader-lfs`、`ffi/util` 等）；
+- 按 KOReader 社区一贯立场，koplugin 属于 KOReader 的**衍生作品**，衍生作品必须以 AGPL 兼容条款分发；
+- PolyForm Noncommercial（全面禁商用 + 禁止再许可）与 AGPL **不兼容**——当前分发状态本身违反上游授权条款。
+
+换成 AGPL-3.0 是修正而非妥协，且与 KOReader 生态（官方插件全为 AGPL）一致。
+
+### 用户已知的 trade-off（明确确认后执行）
+
+| 失去 | 获得 |
+|------|------|
+| 「商业使用需授权」的谈判筹码（AGPL 允许开源商用、公司内部使用） | 上游合规；强 copyleft（闭源修改分发/SaaS 仍被禁止）；双许可可能性（用户是唯一版权人，124/124 commits） |
+
+### 改动内容
+
+| 位置 | 改动 |
+|------|------|
+| `LICENSE` | 全文替换：版权头 + GNU 官网 agpl-3.0.txt 全文（curl 下载保证逐字准确，661 行） |
+| `README.md` | 删「商业授权」章节；License 区改为 AGPL-3.0 + 一句话说明 |
+| `README.en.md` | 删 "Commercial Licensing" 章节；License 区同步 |
+| `plugin/fns_sync.koplugin/README.md` | License 章节改为指向 AGPL-3.0，删商业授权提示 |
+
+Lua 源码无 license header（沿用现状，不加）。
+
+### 历史不可改写（沿 2026-08-05 MIT→PolyForm 同一原则）
+
+- v1.0.0 ~ v1.2.0 release/tag 快照仍是 PolyForm，属诚实历史记录，不动。
+- GitHub About 区 license 标签随 master LICENSE 文件自动更新为 AGPL-3.0。
+
+### 验证
+
+- `sed`/`tail` 核对 LICENSE：版权头 → `GNU AFFERO GENERAL PUBLIC LICENSE Version 3, 19 November 2007` → 标准结尾，完整无缺。
+- `grep -rin polyform README.md README.en.md plugin/ .github/` 无匹配。
+- 推送后核对 GitHub 页面 License 标签与 README License 章节。
+

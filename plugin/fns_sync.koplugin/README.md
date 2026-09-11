@@ -186,4 +186,4 @@ Token 的 scope 不允许 REST 协议。在 FNS WebGUI 新建 Token，scope 包�
 
 ## License
 
-参考仓库根目录的 [PolyForm Noncommercial 1.0.0](../../LICENSE)。商业使用需另行授权，详见根目录 README。
+参考仓库根目录的 [AGPL-3.0](../../LICENSE)。

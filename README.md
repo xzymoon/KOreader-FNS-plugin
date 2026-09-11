@@ -173,12 +173,6 @@ KOreader 里的高亮在 Obsidian 端被包裹成 HL@ 块。
   <img src="./docs/sponsor-wechat.jpg" width="220" alt="微信赞助二维码" />
 </p>
 
-## 商业授权
-
-本项目基于 PolyForm Noncommercial License 1.0.0 授权，允许个人学习、研究、教学、慈善、宗教等非商业用途。
-
-**商业使用需另行获得授权。** 如需商业使用，请通过 [GitHub Issue](https://github.com/xzymoon/KOreader-FNS-plugin/issues/new) 联系作者。
-
 ## License
 
-[PolyForm Noncommercial 1.0.0](./LICENSE)
+[AGPL-3.0](./LICENSE)，与 KOreader 本体一致。任何人可自由使用、修改、分发（包括商业用途），但修改后的版本必须以相同协议开源。
