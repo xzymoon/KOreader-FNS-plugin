@@ -77,3 +77,27 @@ Lua 源码无 license header（沿用现状，不加）。
 - 版权声明 `Copyright © 2026 xzymoon` 移到 `README.md` / `README.en.md` 的 License 章节
 - 推送后 GitHub API license 字段应变为 `agpl-3.0`
 
+## 发版 v1.2.1
+
+### 版本号选择
+
+用户要求把本次改动推进一个版本号。选 **v1.2.1（patch）** 而非 v1.3.0：内容为 1 个 bug 修复 + License/文档变更，无新功能（v1.1.0 / v1.2.0 均为功能版，惯例 minor 留给功能）。
+
+### 重要发现：v1.2.0 的 zip 附件与 tag 不一致
+
+打包前 diff 验证发现：GitHub 上 v1.2.0 release 的 zip 附件中 `main.lua` 与 HEAD（含 b7b57aa 修复）md5 一致，而 **v1.2.0 tag** 里是修复前的旧版——即空高亮守卫修复（8-23 22:02 提交，release 21:57 创建）当时已被补传进附件，但 tag 与 release notes 从未跟上。v1.2.1 把 tag 补齐，release notes 中如实注明此事。
+
+### 打包与验证
+
+- 包结构沿用现格式：`fns_sync.koplugin/`（12 文件）+ `reader_menu_order.lua` + `INSTALL.txt`（从 v1.2.0.zip 附件提取复用，内容仍有效）
+- 内容用 `git archive HEAD` 生成（保证与提交内容逐字节一致），与 v1.2.0 附件 `diff -r`：**仅 README.md 189 行 license 行一处差异** ✓
+- 踩坑记录：GNU tar `--exclude=extras` 会递归排除目录内容，导致 reader_menu_order.lua 丢失；改用单独 `git archive extras/... | tar --strip-components=1` 提取解决
+- v1.2.1.zip 83.2K（v1.2.0 为 81.8K），解包回验内容一致
+
+### 发布内容
+
+- tag `v1.2.1` 打在 `c93ae89`（License 修复 commit），已推送
+- Release notes：修复说明（含"已随 v1.2.0 附件先行分发"的诚实标注）/ License 切换原因与影响 / PayPal 移除 / 升级说明（覆盖复制，配置兼容）
+- 附件：v1.2.1.zip
+- https://github.com/xzymoon/KOreader-FNS-plugin/releases/tag/v1.2.1
+
