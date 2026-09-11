@@ -112,3 +112,26 @@ Lua 源码无 license header（沿用现状，不加）。
 - `README.md` / `README.en.md` 安装步骤 3 各加一条子项：说明它是 KOReader 用户级菜单排序文件、KOReader 只从 `settings/` 读取、插件无法自行控制菜单位置，并链接到文件头注释（OTA 注意事项留在文件注释，不展开进 README）
 - 纯文档改动，不影响 v1.2.1 附件（包内 README 为发版时快照，此差异属正常）
 
+## 每日总结
+
+今日无插件代码功能改动，全部为文档 / License / 发版工作。
+
+| 事项 | 状态 |
+|------|------|
+| 移除 PayPal 捐赠入口（README×2 + FUNDING.yml，共 3 处） | ✅ 完成 |
+| License 切换 PolyForm → AGPL-3.0（含 GitHub 识别修复） | ✅ 完成，GitHub API 已识别 `agpl-3.0` |
+| 发版 v1.2.1（tag + release + v1.2.1.zip 附件，Latest） | ✅ 完成 |
+| README 补充 reader_menu_order.lua 机制说明 | ✅ 完成 |
+
+### 今日 commit（已全部推送）
+
+| commit | 类型 | 内容 |
+|--------|------|------|
+| `6b0a4e7` | docs | 移除 PayPal 捐赠入口 |
+| `5889b40` | license | PolyForm Noncommercial → AGPL-3.0 |
+| `c93ae89` | license | LICENSE 改纯净全文，修复 GitHub 识别（tag v1.2.1 打于此） |
+| `efe1522` | docs | v1.2.1 发版记录 |
+| `01bf62e` | docs | 安装步骤补充 reader_menu_order.lua 机制说明 |
+
+另：tag `v1.2.1` 与 release（含附件）已推送至 GitHub，仓库 Latest release 已更新。工作区干净，master 与 origin/master 同步。
+
