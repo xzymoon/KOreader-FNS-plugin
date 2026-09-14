@@ -129,6 +129,10 @@ Usage: select text while reading → long-press **Ask AI** → type a question (
 
 Enable under **Auto Sync ▸ Bidirectional Sync (experimental)**. Deleting an HL@ block in Obsidian deletes the highlight across devices; highlights created on other devices are pulled back automatically; each highlight additionally stores XPointer coordinates in the note (first-enable privacy confirmation). EPUB/MOBI/AZW3/FB2/TXT/HTML only (crengine formats) — PDF does not support pull.
 
+### UI Language
+
+Menus and messages follow the KOReader UI language: with English selected, the plugin UI is English out of the box (built-in translations, nothing extra to install); other languages show the Chinese source strings. Note-file content is rendered from your own templates and does not follow the UI language.
+
 ## End-to-end Example
 
 KOreader highlights are wrapped into HL@ blocks on the Obsidian side.

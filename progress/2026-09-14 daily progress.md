@@ -72,6 +72,47 @@ spec 原文档保持不动（历史记录，放弃决策以本文档为准）。
 | HTTP CLOSE NIL bug | 8-03 标记"下次修复" | ✅ `api.lua` type check 已修 |
 | color_emoji_map 深拷贝 TODO | 8-02 记录 | ✅ `main.lua` 浅拷贝守卫已处理 |
 
+## 国际化（i18n）实施
+
+### 方案拍板（用户确认）
+
+- **方案 A**：`locale/en_US.lua` Lua 表 + init 时 merge 进全局 `gettext.translation`（KOReader 的 gettext 只加载本体 mo 且 en_US 被短路，插件翻译只能自行注入；插件中文 msgid 与本体英文 msgid 的 key 空间不重叠，互不干扰）
+- **术语**：模式名「离线本地笔记」→ `Local Notes (Offline)`；快捷模板 → `Translate Prompt` 风格
+- **范围**：只做 UI 字符串，笔记内容仍由用户模板渲染（默认模板的「📖 第 N 页」等中文标签不随 UI 语言切换）
+
+### 改动内容
+
+| 文件 | 内容 |
+|------|------|
+| `plugin/fns_sync.koplugin/i18n.lua`（新） | 纯逻辑模块：`needsEnglish(lang)`（`en` 前缀判定）+ `merge(target, translations)`（幂等），无 KOReader 依赖、可单测 |
+| `plugin/fns_sync.koplugin/locale/en_US.lua`（新） | 186 条英文翻译表，按功能分组，头部写维护说明（key 须与 msgid 逐字一致、英文原文条目不收） |
+| `plugin/fns_sync.koplugin/main.lua` | init 最前加注入块：读 `G_reader_settings` 的 `language`，英文则 `pcall require("locale/en_US")` merge 进 `_.translation`；`reader.lua` 先应用语言再加载插件，注入不会被 changeLang 清掉 |
+| `tests/test_i18n.lua`（新） | 14 项测试（见下） |
+| `README.md` / `README.en.md` | 「配置」章节末补「界面语言 / UI Language」小节 |
+
+### 测试设计（test_i18n.lua，14 项全过）
+
+1. needsEnglish 边界（en_US/en_GB/en ✓；zh_CN/C/nil/空串/非字符串 ✗）
+2. merge 覆盖/新增/幂等
+3. en_US.lua 数据完整性（186 条 key/value 均为非空 string）
+4. **源码覆盖对比**：plain-find 扫描 main/api/ai/_meta 源码提取全部 `_("...")` msgid（189 条唯一），白名单 7 条英文原文（FNS Sync/max_tokens/temperature 等）外必须全部有翻译——未来新增 UI 字符串漏翻译会被测试直接暴露
+5. **占位符保真**：每条翻译的 `%d/%s/%1/%2/{word}` 集合与 msgid 严格一致
+
+回归：现有 7 个单测（gate/conf_import/localstore/marker_ai/threeway/config_ai/ai_chat）共 230 项全过。
+
+### 实施中抓到的问题
+
+- **真 bug（占位符校验抓到）**：「同步成功（+%d 更新%d 删除%d）」3 个 `%d`，英文初稿丢了 1 个 → 修正为 `Sync OK (+%d added, %d updated, %d deleted)`
+- **翻译遗漏 6 条**：带缩进的队列状态变体（`  [失败 %d 次]` 等 3 条）、`AI 读书助手`、`AI 块级联删除数量异常`、`说明`——源码覆盖测试抓出后补齐
+- **Lua pattern 踩坑**（记录备用）：提取 `_("...")` 无法用 pattern 捕获表达——捕获组内**全部**模式都算捕获内容，`")` 两字符结束序列会把尾引号吞进捕获或截断跨行；含 `\"` 的 msgid 还会中途误停。最终用 `string.find(plain)` 手工切片
+- **源码级转义**：源码文本里的 `\n` 是两个字符，模块加载后才是真换行——测试提取需反转义（`\\(.)` 逐字符处理）才能与 en_US.lua 解析后的 key 对齐
+
+### 待真机验证（Kindle）
+
+1. 界面语言设为 English → 插件菜单/提示显示英文
+2. 切回中文 → 恢复中文
+3. 笔记内容渲染不受 UI 语言影响
+
 ## 每日总结
 
 无代码改动，纯盘点 + 路线决策落盘。
@@ -82,6 +123,7 @@ spec 原文档保持不动（历史记录，放弃决策以本文档为准）。
 | M8 spec 后续演进 7 项放弃 | ✅ 决策落盘 |
 | M7「留待 M8+」5 项列为待做 | ✅ 决策落盘 |
 | 国际化 / plugin README 图 / T4 三项状态核实 | ✅ 结论见上 |
+| **国际化实施**（i18n.lua + en_US.lua 186 条 + init 注入 + 14 项新单测 + README） | ✅ 单测全绿（14 + 230 回归），待 Kindle 真机验证 |
 
 ### 今日 commit
 

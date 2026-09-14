@@ -60,6 +60,7 @@ local Marker = require("marker")
 local Threeway = require("threeway")
 local Gate = require("gate")
 local ConfImport = require("confimport")
+local I18n = require("i18n")
 local Event = require("ui/event")
 
 local FnsSync = WidgetContainer:extend{
@@ -84,6 +85,23 @@ local FnsSync = WidgetContainer:extend{
 -- ===========================================================================
 
 function FnsSync:init()
+    -- M11 i18n: English UI translations. KOReader's gettext loads only its
+    -- own mo files (and changeLang short-circuits en_US to untranslated),
+    -- so plugin strings must be merged into the shared translation table
+    -- by the plugin itself. Runs before any menu is built; idempotent per
+    -- init. reader.lua applies the UI language before plugins load, so
+    -- this merge is never clobbered by changeLang().
+    local lang = G_reader_settings:readSetting("language")
+    if I18n.needsEnglish(lang) then
+        local ok, en = pcall(require, "locale/en_US")
+        if ok then
+            I18n.merge(_.translation, en)
+            logger.info("[FNS] i18n: English UI translations loaded")
+        else
+            logger.warn("[FNS] i18n: failed to load locale/en_US:", en)
+        end
+    end
+
     self.settings = G_reader_settings:readSetting("fns_sync", {})
     -- Backfill any missing defaults (preserves user values already set).
     -- M8 Task D fix (reviewer H-1): table-typed defaults are one-level
