@@ -12,7 +12,7 @@ Sync highlights and notes out of KOreader — **two switchable modes**: sync to 
 - 🔌 **FNS server mode** (optional): check the mode switch, fill in service settings, sync to Obsidian (built on the [fast-note-sync-service](https://github.com/haierkeys/fast-note-sync-service) REST API)
 - ✨ **Auto-sync** (triggered on highlight/note edits and book close, debounced; works in both modes)
 - 📦 **Offline queue** (FNS mode: queued while offline, auto-pushed once reconnected; retry + freeze-on-failure)
-- 🔄 **Bidirectional cross-device sync** (FNS mode, experimental: three-way merge — deleting an HL@ block in Obsidian deletes the highlight across devices)
+- 🔄 **Two-way cross-device sync** (FNS mode, experimental: three-way merge — deleting an HL@ block in Obsidian deletes the highlight across devices)
 - 🌱 **Seed migration**: notes created in offline mode are uploaded as the seed on your first FNS sync after configuring a server
 - 📝 **Item-level HL@ marker** (your interleaved edits in Obsidian are preserved)
 - 🎨 **Customizable templates** (excerpt / note / filename templates, color emoji)
@@ -68,7 +68,7 @@ FNS Sync (Settings ▸ Network)
 │   │   ├─ [✓] Enable Auto Sync
 │   │   ├─ [✓] On Highlight Edit / [ ] On Book Close
 │   │   ├─ Sync Delay (seconds)
-│   │   └─ Bidirectional Sync (experimental)
+│   │   └─ Two-way Sync (Experimental)
 │   │       ├─ [ ] Enable / [ ] Auto-pull on Book Open
 │   │       └─ Notes
 │   ├─ Pull Remote Highlights Now
@@ -125,9 +125,9 @@ AI Reading Assistant (Tools tab)
 
 Usage: select text while reading → long-press **Ask AI** → type a question (or tap translate/explain/comment) → in the answer window you can keep asking, summarize, or **Add to Note** (written to Obsidian in FNS mode, or to local FNS-Notes/ in offline mode; deleted together with its excerpt).
 
-### Bidirectional sync (FNS mode, experimental)
+### Two-way Sync (FNS mode, experimental)
 
-Enable under **Auto Sync ▸ Bidirectional Sync (experimental)**. Deleting an HL@ block in Obsidian deletes the highlight across devices; highlights created on other devices are pulled back automatically; each highlight additionally stores XPointer coordinates in the note (first-enable privacy confirmation). EPUB/MOBI/AZW3/FB2/TXT/HTML only (crengine formats) — PDF does not support pull.
+Enable under **Auto Sync ▸ Two-way Sync (Experimental)**. Deleting an HL@ block in Obsidian deletes the highlight across devices; highlights created on other devices are pulled back automatically; each highlight additionally stores XPointer coordinates in the note (first-enable privacy confirmation). EPUB/MOBI/AZW3/FB2/TXT/HTML only (crengine formats) — PDF does not support pull.
 
 ### UI Language
 
@@ -163,7 +163,7 @@ Full usage docs (HL@ block structure, Obsidian safe edit zones, template customi
 
 Queue data (book path + title) is stored in the `fns_sync_queue` field of KOreader's global `settings.reader.lua`; **not-yet-synced AI answers** in `fns_sync_pending_ai` (answer text + model name). **No FNS tokens or other credentials.** To opt out of the offline queue: **FNS Sync (FNS mode) ▸ Offline Queue ▸ Enable Offline Queue** off.
 
-⚠️ **AI API keys are stored in plaintext** in `settings.reader.lua` (same trust level as the FNS api_token). KOreader's config is plaintext on-device; encryption would only guard against USB snooping, not a lost device — revoke your key at the provider's console if the device is lost. Same applies to `fns_sync.conf`. Bidirectional sync additionally records per-highlight XPointer coordinates in notes (reading progress can be inferred) — be aware with shared vaults.
+⚠️ **AI API keys are stored in plaintext** in `settings.reader.lua` (same trust level as the FNS api_token). KOreader's config is plaintext on-device; encryption would only guard against USB snooping, not a lost device — revoke your key at the provider's console if the device is lost. Same applies to `fns_sync.conf`. Two-way sync additionally records per-highlight XPointer coordinates in notes (reading progress can be inferred) — be aware with shared vaults.
 
 ## Feedback & Contributions
 

@@ -93,12 +93,17 @@ function FnsSync:init()
     -- this merge is never clobbered by changeLang().
     local lang = G_reader_settings:readSetting("language")
     if I18n.needsEnglish(lang) then
-        local ok, en = pcall(require, "locale/en_US")
-        if ok then
-            I18n.merge(_.translation, en)
+        -- dofile (not require): package.loaded is a global namespace
+        -- shared by all koplugins — another plugin shipping its own
+        -- locale/en_US.lua could otherwise be loaded in our place (and
+        -- vice versa), silently. self.path is injected by the plugin
+        -- loader (pluginloader.lua).
+        local ok, locale_or_err = pcall(dofile, self.path .. "/locale/en_US.lua")
+        if ok and type(locale_or_err) == "table" then
+            I18n.merge(_.translation, locale_or_err)
             logger.info("[FNS] i18n: English UI translations loaded")
         else
-            logger.warn("[FNS] i18n: failed to load locale/en_US:", en)
+            logger.warn("[FNS] i18n: failed to load locale/en_US.lua:", locale_or_err)
         end
     end
 

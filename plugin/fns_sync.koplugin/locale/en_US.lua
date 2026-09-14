@@ -37,8 +37,6 @@ return {
     ["重试冻结条目"] = "Retry Frozen Items",
     ["清空队列"] = "Clear Queue",
     ["清空"] = "Clear",
-    ["[失败 %d 次]"] = "[failed %d times]",
-    ["[已冻结]"] = "[frozen]",
     ["  [失败 %d 次]"] = "  [failed %d times]",
     ["  [已冻结]"] = "  [frozen]",
     ["[!] 离线队列（%d 条已冻结）"] = "[!] Offline queue (%d items frozen)",
@@ -87,7 +85,6 @@ return {
     ["当前书信息"] = "Current Book Info",
     ["自定义书名"] = "Custom Title",
     ["自定义作者"] = "Custom Author",
-    ["重置为文件元数据"] = "Reset to File Metadata",
     ["🔄 重置为文件元数据"] = "🔄 Reset to File Metadata",
 
     -- ── Advanced ──
@@ -132,7 +129,7 @@ return {
     ["取消"] = "Cancel",
     ["【原文】"] = "[Original]",
     ["关于"] = "About",
-    ["说明"] = "Description",
+    ["说明"] = "Help",
     ["开启"] = "Enable",
 
     -- ── Input hints ──
@@ -140,7 +137,6 @@ return {
     ["请输入问题"] = "Please enter a question",
     ["书名"] = "Title",
     ["作者"] = "Author",
-    ["（未设置）"] = "(not set)",
     ["(未设置)"] = "(not set)",
     ["(无打开的书)"] = "(no book open)",
     ["无打开的书"] = "No book open",

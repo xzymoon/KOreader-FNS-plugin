@@ -113,6 +113,32 @@ spec 原文档保持不动（历史记录，放弃决策以本文档为准）。
 2. 切回中文 → 恢复中文
 3. 笔记内容渲染不受 UI 语言影响
 
+## 审查与修复（code-reviewer agent + 自查）
+
+### 审查结论（对照 E:\koreader-src 源码级验证）
+
+确认安全：`require("locale/en_US")` 在 KOReader 插件加载链路下解析正确；merge 时序/切语言重启/中文用户零影响/与核心翻译零碰撞/无重复 key/pcall 优雅降级。
+
+### 发现与修复（9 项全修，全量测试后 commit）
+
+| 级别 | 问题 | 修复 |
+|------|------|------|
+| **HIGH** | `needsEnglish` 对 `nil`/`"C"` 返回 false——KOReader 语言菜单选 "English" 存的是 `"C"`（language.lua:7 `C = "English"`），且菜单无 en_US（只有 C/en_GB）→ **主受众（英文 UI 用户）拿不到翻译**，仅 en_GB 触发 | 判定改为 `nil`/`"C"`/`en*` → true；单测改期望并注明缘由 |
+| MEDIUM | `require("locale/en_US")` 占共享 `package.loaded` 键——同装另一个带同名文件的第三方插件会静默互换翻译表 | 改 `pcall(dofile, self.path .. "/locale/en_US.lua")`（pluginloader 注入的 self.path，完全绕开全局缓存） |
+| MEDIUM | 测试只扫 4 个文件属巧合完备，其他模块未来加 `_()` 会静默漏测 | sources 扩到全部 11 个模块文件 |
+| MEDIUM | README.en.md 用 "Bidirectional sync"，翻译表是 "Two-way Sync"——文档与 UI 不一致（自查发现） | README.en.md 5 处统一改 "Two-way" |
+| LOW | 4 条孤儿翻译 key（无缩进变体×2、无 emoji、全角括号——源码 msgid 是另一形态）（自查） | 删除；测试补 orphan 反向检查（防 msgid 改后旧翻译残留） |
+| LOW | `_("说明")` 译 "Description" 不贴切，语境是弹出使用帮助（main.lua:2843）（自查） | 改 "Help" |
+| LOW | 测试 `")` 提取会命中 msgid 内 `\")` 序列提前截断；`\r` 反转义缺失 | e2 查找跳过 `\"` 的循环；补 `\r` 分支 |
+| LOW | `{{VALUE:字段}}` 复合占位符不受校验保护 | `{{` 出现次数双侧计数比对 |
+| LOW | pcall 失败分支变量名 `en` 实为错误消息，误导 | 改名 `locale_or_err` |
+
+### 修复后状态
+
+- `lua tests/test_i18n.lua`：14 项全过（182 条翻译，189 msgid 全覆盖，0 missing 0 orphan，占位符全匹配）
+- 回归 7 个单测 230 项全过
+- 注：修复过程中曾把带缩进的真实 key 误当孤儿删除（孤儿是无缩进版），下一次 Edit 立即纠正——测试的 missing 检查本可兜住此类错误，这也印证了覆盖测试的价值
+
 ## 每日总结
 
 无代码改动，纯盘点 + 路线决策落盘。
@@ -124,6 +150,7 @@ spec 原文档保持不动（历史记录，放弃决策以本文档为准）。
 | M7「留待 M8+」5 项列为待做 | ✅ 决策落盘 |
 | 国际化 / plugin README 图 / T4 三项状态核实 | ✅ 结论见上 |
 | **国际化实施**（i18n.lua + en_US.lua 186 条 + init 注入 + 14 项新单测 + README） | ✅ 单测全绿（14 + 230 回归），待 Kindle 真机验证 |
+| **审查与修复**（agent + 自查：1 HIGH + 3 MEDIUM + 5 LOW 全修） | ✅ HIGH=英文主路径失效（C/nil 判定），修复后全量测试绿 |
 
 ### 今日 commit
 

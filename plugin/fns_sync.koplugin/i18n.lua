@@ -18,9 +18,14 @@ integration point is a single call in main.lua init.
 local I18n = {}
 
 --- Whether this UI language should get English plugin translations.
--- @string lang G_reader_settings "language" value ("en_US", "en_GB",
--- "zh_CN", "C", nil, ...)
+-- KOReader's language menu stores "English" as "C" (frontend/ui/
+-- language.lua: C = "English"); en_US is not even offered (only "C"
+-- and "en_GB"). An unset language (nil) also means the default
+-- English UI. So nil / "C" / any "en*" locale → true.
+-- @string lang G_reader_settings "language" value ("C", "en_GB",
+-- "zh_CN", nil, ...)
 function I18n.needsEnglish(lang)
+    if lang == nil or lang == "C" then return true end
     return type(lang) == "string" and lang:sub(1, 2) == "en"
 end
 
